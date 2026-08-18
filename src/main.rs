@@ -111,8 +111,7 @@ async fn main() -> Result<()> {
             
             let app_clone = Arc::clone(&app.node);
             let tcp_handle = tokio::spawn(async move {
-                let mut node = app_clone.lock().await;
-                node.start_tcp_server(port).await
+                P2PNode::start_tcp_server(app_clone, port).await
             });
             
             let app_clone = app.clone();
@@ -324,21 +323,37 @@ async fn websocket_listener(app: BotApp) -> Result<()> {
                 msg = ws_read.next() => {
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
-                            if let Ok(event) = serde_json::from_str::<NapCatEvent>(&text) {
-                                if event.post_type == "message" {
-                                    let message_type = event.message_type.as_deref().unwrap_or("");
-                                    let user_id = event.user_id;
-                                    let msg = extract_message_text(&event.message);
+                            println!("[WS] 收到文本帧: {}", text);
+                            match serde_json::from_str::<NapCatEvent>(&text) {
+                                Ok(event) => {
+                                    println!("[WS] 解析成功 post_type={}", event.post_type);
+                                    if event.post_type == "message" {
+                                        let message_type = event.message_type.as_deref().unwrap_or("");
+                                        let user_id = event.user_id;
+                                        let msg = extract_message_text(&event.message);
 
-                                    if message_type == "private" {
-                                        let _ = app.send_event(BotEvent::PrivateMessage { user_id, message: msg.clone() }).await;
-                                    } else if message_type == "group" {
-                                        if let Some(group_id) = event.group_id {
-                                            let _ = app.send_event(BotEvent::GroupMessage { user_id, group_id, message: msg.clone(), raw_message: msg }).await;
+                                        if message_type == "private" {
+                                            let _ = app.send_event(BotEvent::PrivateMessage { user_id, message: msg.clone() }).await;
+                                        } else if message_type == "group" {
+                                            if let Some(group_id) = event.group_id {
+                                                let _ = app.send_event(BotEvent::GroupMessage { user_id, group_id, message: msg.clone(), raw_message: msg }).await;
+                                            }
                                         }
                                     }
                                 }
+                                Err(e) => {
+                                    println!("[WS] 解析失败: {}", e);
+                                }
                             }
+                        }
+                        Some(Ok(WsMessage::Ping(_))) => {
+                            println!("[WS] 收到Ping帧");
+                        }
+                        Some(Ok(WsMessage::Pong(_))) => {
+                            println!("[WS] 收到Pong帧");
+                        }
+                        Some(Ok(WsMessage::Binary(b))) => {
+                            println!("[WS] 收到二进制帧: {} 字节", b.len());
                         }
                         Some(Ok(WsMessage::Close(_))) | None => {
                             println!("[*] WebSocket关闭，1秒后重连...");

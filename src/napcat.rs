@@ -99,20 +99,29 @@ impl P2PNode {
         peers.get(&user_id).map(|p| format!("{}:{}", p.ip, p.port))
     }
 
-    pub async fn start_tcp_server(&mut self, port: u16) -> Result<()> {
+    pub async fn start_tcp_server(node: Arc<Mutex<P2PNode>>, port: u16) -> Result<()> {
         let addr = format!("0.0.0.0:{}", port);
         let listener = TcpListener::bind(&addr)
             .await
             .context("绑定TCP端口失败")?;
         
-        self.port = port;
-        println!("[*] P2P服务监听在 {}:{}", self.ip, port);
+        // 短暂加锁设置端口，然后立即释放（避免长期持有锁导致死锁）
+        {
+            let mut n = node.lock().await;
+            n.port = port;
+        }
+        println!("[*] P2P服务监听在 0.0.0.0:{}", port);
         
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     println!("[*] 新连接: {}", addr);
-                    self.handle_connection(stream).await;
+                    // 仅在需要时短暂加锁读取IP，避免长期持有锁
+                    let ip = {
+                        let n = node.lock().await;
+                        n.ip.clone()
+                    };
+                    Self::handle_connection(&ip, stream).await;
                 }
                 Err(e) => {
                     eprintln!("[!] 连接错误: {}", e);
@@ -121,7 +130,7 @@ impl P2PNode {
         }
     }
 
-    async fn handle_connection(&self, mut stream: TcpStream) {
+    async fn handle_connection(ip: &str, mut stream: TcpStream) {
         let mut buf = [0; 4096];
         match stream.read(&mut buf).await {
             Ok(n) if n > 0 => {
@@ -129,7 +138,7 @@ impl P2PNode {
                 println!("[*] 收到数据: {}", msg.trim());
                 
                 if msg.starts_with("PING ") {
-                    let reply = format!("PONG {}", self.ip);
+                    let reply = format!("PONG {}", ip);
                     if let Err(e) = stream.write_all(reply.as_bytes()).await {
                         eprintln!("[!] 连接错误: {}", e);
                     }
@@ -311,7 +320,7 @@ impl NapCatClient {
     }
 
     pub async fn get_friends(&self) -> Result<Vec<FriendInfo>> {
-        let url = format!("{}/get_friends", self.base_url());
+        let url = format!("{}/get_friend_list", self.base_url());
         let resp: NapCatResponse<Vec<FriendInfo>> = self.client.get(&url).send().await?
             .json().await?;
         
@@ -323,7 +332,7 @@ impl NapCatClient {
     }
 
     pub async fn get_groups(&self) -> Result<Vec<GroupInfo>> {
-        let url = format!("{}/get_groups", self.base_url());
+        let url = format!("{}/get_group_list", self.base_url());
         let resp: NapCatResponse<Vec<GroupInfo>> = self.client.get(&url).send().await?
             .json().await?;
         
