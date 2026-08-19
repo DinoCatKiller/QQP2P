@@ -1,211 +1,145 @@
-# QQ P2P 手机+电脑连接指南
+# QQ P2P 手机+电脑连接指南（全 Rust 版）
+
+> 手机端与电脑端运行**同一份 Rust 代码**，各自连接本机 NapCat（OneBot v11），
+> 两端通过 QQ 消息互换公网节点信息，再建立 TCP 直连（P2P）。
+> 打洞方案详见 `P2P_HOLE_PUNCHING.md`。
 
 ## 架构说明
 
 ```
-电脑 (编译Rust)          手机 (运行Python)
-     |                        |
-     |  1. 编译release        |
-     |----------------------->|
-     |                        |
-     |  2. 运行Rust程序       |
-     |                        |
-     |<-----------------------|
-     |  3. 手机通过HTTP调用   |
-     |                        |
-电脑NapCat               手机NapCat
-(127.0.0.1:30000)      (127.0.0.1:30000)
+电脑                                 手机
+┌──────────────────────┐            ┌──────────────────────────────┐
+│ qqp2p.exe  (Rust编译) │   TCP直连   │ qqp2p (Termux 中 Rust 编译)   │
+│      ↕                │◄──────────►│      ↕                       │
+│ NapCat (Windows 版)   │   P2P连接   │ NapCat (Termux/proot 中 Linux 版) │
+│ 127.0.0.1:3000/3001   │            │ 127.0.0.1:3000/3001          │
+└──────────────────────┘            └──────────────────────────────┘
+    登录一个 QQ 号                     登录另一个 QQ 号
 ```
 
-## 方案一：电脑+手机（推荐）
+要点：
 
-### 步骤1：电脑编译Release版本
+- `qqp2p` 连接地址默认 `127.0.0.1:3000`（HTTP）/ `3001`（WebSocket），正好指向**本机** NapCat，手机端**无需修改任何配置**。
+- 手机端**不是**复制电脑的 `qqp2p.exe`（Windows 程序无法在 Android 运行），而是把源码放进 Termux 重新编译出 ARM 原生二进制。
+
+## 一、电脑端
 
 ```bash
+# 1. 编译
 cd H:\QQP2P
 cargo build --release
+
+# 2. 启动电脑 NapCat（Windows 版），登录电脑机器人 QQ
+
+# 3. 运行
+target\release\qqp2p.exe start --user-id 你的电脑QQ号 --port 8080
 ```
 
-编译完成后，二进制文件在：
-```
-H:\QQP2P\target\release\qqp2p.exe
-```
+## 二、手机端（Termux）
 
-### 步骤2：传到手机
+### 步骤 1：安装 Termux
 
-**方法A：USB传输**
-```bash
-# 电脑执行
-copy target\release\qqp2p.exe D:\
-# 然后USB连接手机，复制文件
-```
+- 从 **F-Droid** 或 GitHub Releases 下载最新 Termux APK
+  （`https://github.com/termux/termux-app/releases/latest`）
+- ⚠️ 不要用 Google Play 版（已停止维护，会报仓库不可用）
+- 首次打开执行 `termux-setup-storage` 授权存储访问
 
-**方法B：HTTP传输**
-```bash
-# 电脑启动临时服务器
-cd H:\QQP2P\target\release
-python -m http.server 8080
-```
-然后手机浏览器访问 `http://电脑IP:8080/qqp2p.exe`
-
-### 步骤3：手机安装依赖
-
-**Android (Termux):**
-```bash
-pkg install python
-pip install aiohttp websockets
-```
-
-**iPhone (iSH/Shadow):**
-```bash
-apk add python3
-pip3 install aiohttp websockets
-```
-
-### 步骤4：手机运行
+### 步骤 2：安装手机 NapCat（QQ 协议层）
 
 ```bash
-# 方法A：使用Python版（推荐，支持WebSocket监听）
-python bot_full.py --user-id 你的手机QQ号 --start
+# 拉取项目脚本（或先 git clone 项目）
+pkg install -y git
+git clone https://github.com/DinoCatKiller/QQP2P.git
+cd QQP2P
 
-# 方法B：使用简化版
-python bot.py --user-id 你的手机QQ号 --start
+# 一键安装：自动装 proot 容器 + Linux 版 QQ + NapCat
+bash scripts/termux_napcat.sh
 ```
 
-### 步骤5：电脑运行
+装完启动 NapCat 后：
+
+1. **首次扫码登录**手机机器人 QQ（登录方式取决于安装器提示）
+2. 打开 WebUI：`http://127.0.0.1:6099/webui`
+3. 在网络配置中启用并确认：
+   - HTTP 服务：`127.0.0.1:3000`
+   - WebSocket 服务端：`127.0.0.1:3001`，路径 `/onebot/v11/ws`
+
+> 若官方一键脚本不可用，脚本末尾会打印手动方案（proot-distro 装 Ubuntu → 容器内装 NapCat），照抄即可。
+
+### 步骤 3：编译手机端机器人（全 Rust）
 
 ```bash
-# 在电脑上启动Rust版本
-cargo run -- start --user-id 你的电脑QQ号 --port 8080
+cd QQP2P
+bash scripts/termux_setup.sh
 ```
 
----
+脚本会：更新软件源 → 安装 `rust clang openssl pkg-config git` → `cargo build --release`
+（首次编译约 5~15 分钟，属正常现象，保持屏幕常亮）。
 
-## 方案二：纯Python（跨平台）
-
-### 电脑和手机都运行Python版本
+### 步骤 4：启动手机端机器人
 
 ```bash
-# 1. 安装依赖
-pip install aiohttp websockets
-
-# 2. 运行
-python bot_full.py --user-id 你的QQ号 --start
+./target/release/qqp2p start --user-id 你的手机QQ号 --port 8080
 ```
 
----
+看到 `[*] 等待QQ消息...` 即启动成功。
 
-## 完整测试流程
+## 三、在 QQ 中测试 P2P
 
-### 设备A（电脑）
-```bash
-# 1. 启动NapCat
-cd H:\napcat
-.\launcher.bat
+**A 发送：**
 
-# 2. 编译运行
-cd H:\QQP2P
-cargo run -- start --user-id A的QQ号 --port 8080
-```
-
-### 设备B（手机）
-```bash
-# 1. 安装Termux
-# 从F-Droid下载Termux
-
-# 2. 安装依赖
-pkg install python
-pip install aiohttp websockets
-
-# 3. 复制bot_full.py到手机
-# 4. 启动NapCat（如果手机也有NapCat）
-# 5. 运行
-python bot_full.py --user-id B的QQ号 --start
-```
-
-### 在QQ中测试
-
-**A发送：**
 ```
 @机器人 给我一个p2p
 ```
 
-**B收到：**
+**A 收到：**
+
 ```
 🌐 我的P2P节点信息:
 📍 公网IP: xxx.xxx.xxx.xxx
 🔌 端口: 8080
 ```
 
-**B也发送：**
-```
-@机器人 给我一个p2p
-```
+**B 也发送 `@机器人 给我一个p2p`，获取自己的节点信息。**
 
-**A收到：**
-```
-🌐 我的P2P节点信息:
-📍 公网IP: yyy.yyy.yyy.yyy
-🔌 端口: 8080
-```
+**然后互告对端节点：**
 
-**A告诉B自己的IP，B告诉A自己的IP**
-
-**A发送：**
 ```
-@机器人 我的IP是 B的IP:8080
-```
-
-**B发送：**
-```
-@机器人 我的IP是 A的IP:8080
+@机器人 我的IP是 B的公网IP:8080
 ```
 
 **双方收到：**
+
 ```
 ✅ 已记录你的IP: xxx.xxx.xxx.xxx:8080
 🔄 正在尝试连接...
 ```
 
----
+连接成功后即建立 TCP 直连，后续数据不再经过任何中间服务器。
 
 ## 常见问题
 
-### Q: 手机没有NapCat怎么办？
-A: 手机只运行Python脚本，通过电脑的NapCat API通信。需要确保电脑和手机在同一网络，或者使用内网穿透。
+### Q: 手机上为什么要编译 Rust，不直接复制 qqp2p.exe？
+A: `qqp2p.exe` 是 Windows 可执行文件（PE + x86_64），Android 是 Linux 内核 + ARM，格式不兼容，无法运行。手机端必须用同一份源码在 Termux 里编译出 ARM 版二进制。
 
-### Q: 如何获取电脑IP？
-A: 
-```bash
-# Windows
-ipconfig
-# 查看 IPv4 地址
-```
+### Q: 手机 NapCat 一定装得起来吗？
+A: NapCat 官方无 Android 版，但官方提供 Termux 安装器（在 proot 容器中跑 Linux 版）。已在社区大量验证。若你手机内存 < 4GB，建议先跑通"手机连电脑 NapCat"验证 P2P，再折腾手机 NapCat。
+
+### Q: 手机没有 NapCat，能先验证 P2P 吗？
+A: 可以。让电脑 NapCat 的监听地址从 `127.0.0.1` 改为 `0.0.0.0`，手机端 qqp2p 通过 `--napcat-host 电脑IP`（若代码已支持该参数）或临时改源码地址连接。前提是手机与电脑在同一局域网（或使用内网穿透）。
+
+### Q: 如何获取电脑 IP？
+A: Windows 执行 `ipconfig`，查看 IPv4 地址；手机查看 WiFi 详情。
 
 ### Q: 防火墙问题
-A: 确保电脑防火墙允许：
-- TCP 8080端口（P2P连接）
-- TCP 30000端口（NapCat HTTP）
-- TCP 30001端口（NapCat WebSocket）
+A: 确保电脑防火墙放行：
+- TCP `8080`（P2P 连接）
+- TCP `3000`（NapCat HTTP）
+- TCP `3001`（NapCat WebSocket）
+- UDP/TCP `6099`（NapCat WebUI，可选）
 
----
+## 依赖说明
 
-## 依赖安装
+Rust 依赖已在 `Cargo.toml` 中（tokio / clap / reqwest / serde / tokio-tungstenite 等），手机端由 `termux_setup.sh` 自动安装工具链，无需手动处理。
 
-### Python依赖
-```bash
-pip install aiohttp websockets
-```
-
-### Rust依赖（已在Cargo.toml中）
-```toml
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
-reqwest = { version = "0.11", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-futures-util = "0.3"
-tokio-tungstenite = "0.21"
-```
+> 手机端配置文件 `config.ini`：当前版本 NapCat 地址为代码内硬编码默认值 `127.0.0.1:3000/3001`，与手机本机 NapCat 一致，无需改动；`config.ini` 为预留配置。
