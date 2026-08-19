@@ -7,6 +7,7 @@
 //! - `app`  ：BotApp 消息处理
 
 mod app;
+mod holepunch;
 mod napcat;
 mod p2p;
 mod ws;
@@ -35,6 +36,12 @@ enum Commands {
         user_id: u64,
         #[arg(short, long, default_value = "8080")]
         port: u16,
+        /// UDP 打洞监听端口（默认与 TCP 端口相同）
+        #[arg(long)]
+        udp_port: Option<u16>,
+        /// STUN 服务器地址（NAT 映射查询）
+        #[arg(long, default_value = "stun.l.google.com:19302")]
+        stun: String,
     },
     /// 查询本机IP
     Ip {
@@ -80,10 +87,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { user_id, port } => {
+        Commands::Start { user_id, port, udp_port, stun } => {
             println!("[*] 启动 QQ P2P 机器人...");
             println!("[*] 用户ID: {}", user_id);
             println!("[*] TCP端口: {}", port);
+            let udp_port = udp_port.unwrap_or(port);
+            println!("[*] UDP打洞端口: {}", udp_port);
+            println!("[*] STUN服务器: {}", stun);
             println!();
 
             let (app, event_rx) = BotApp::new(user_id).await?;
@@ -104,6 +114,19 @@ async fn main() -> Result<()> {
             let app_clone = Arc::clone(&app.node);
             let tcp_handle = tokio::spawn(async move {
                 P2PNode::start_tcp_server(app_clone, port).await
+            });
+
+            // UDP 打洞服务：解析 STUN 地址 → 绑定 UDP → 查询映射 → 监听打洞报文
+            let udp_app = Arc::clone(&app.node);
+            tokio::spawn(async move {
+                match crate::holepunch::resolve_stun_server(&stun).await {
+                    Ok(srv) => {
+                        if let Err(e) = P2PNode::start_udp_server(udp_app, udp_port, srv).await {
+                            eprintln!("[!] UDP打洞服务启动失败: {}", e);
+                        }
+                    }
+                    Err(e) => eprintln!("[!] STUN 地址解析失败: {}", e),
+                }
             });
 
             let app_clone = app.clone();
