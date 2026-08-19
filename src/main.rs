@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
             println!("[+] 公网IP: {}", ip);
             println!("[+] 机器人昵称: {}", app.my_name);
             println!("[*] 机器人已就绪!");
-            println!("[*] 仅当消息中 @{} 时才会触发回信", app.my_name);
+            println!("[*] 私聊直接回复; 群聊需 @{} 或互发P2P节点信息", app.my_name);
             println!();
             println!("[*] 使用说明:");
             println!("[*]   • 对方在QQ中 @你 发送: /ip");

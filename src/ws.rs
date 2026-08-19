@@ -73,9 +73,14 @@ fn is_mentioned_bot(event: &NapCatEvent, my_user_id: u64, my_name: &str) -> bool
         let seg_type = seg.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match seg_type {
             "at" => {
-                // 按 @ 的 QQ 号匹配(最可靠)
-                if let Some(qq) = seg.pointer("/data/qq").and_then(|v| v.as_str()) {
-                    if qq == my_id_str {
+                // 按 @ 的 QQ 号匹配(最可靠), 兼容字符串 "2864305010" 与数字 2864305010 两种类型
+                if let Some(qq) = seg.pointer("/data/qq") {
+                    let qq_matches = match qq {
+                        serde_json::Value::String(s) => s.as_str() == my_id_str,
+                        serde_json::Value::Number(n) => n.as_u64() == Some(my_user_id),
+                        _ => false,
+                    };
+                    if qq_matches {
                         return true;
                     }
                 }
@@ -116,9 +121,8 @@ pub async fn run_message_handler(app: BotApp, mut event_rx: tokio::sync::broadca
     loop {
         match event_rx.recv().await {
             Ok(BotEvent::PrivateMessage { user_id, message }) => {
-                if user_id == app.my_user_id {
-                    continue;
-                }
+                // 监听层已用事件自带 self_id 过滤过"自己发的消息",
+                // 事件能进到广播队列就一定是别人发的, 这里不再重复过滤(避免依赖命令行 user-id)
                 println!("[*] 收到私聊消息: {} - {}", user_id, message);
 
                 if let Some(reply) = app.handle_message(user_id, &message).await {
@@ -128,9 +132,7 @@ pub async fn run_message_handler(app: BotApp, mut event_rx: tokio::sync::broadca
                 }
             }
             Ok(BotEvent::GroupMessage { user_id, group_id, message, raw_message: _ }) => {
-                if user_id == app.my_user_id {
-                    continue;
-                }
+                // 同上: 不再按命令行 user-id 过滤
                 println!("[*] 收到群消息: {} - {}", user_id, message);
 
                 if let Some(reply) = app.handle_message(user_id, &message).await {
@@ -202,14 +204,15 @@ pub async fn websocket_listener(app: BotApp) -> Result<()> {
                                         }
                                         let msg = extract_message_text(&event.message);
 
-                                        // 只有当 @机器人(昵称取自登录账号信息) 时才触发回信
-                                        // P2P 协议握手消息(含对方节点信息)除外: 允许同款机器人互发节点信息
-                                        if !is_mentioned_bot(&event, app.my_user_id, &app.my_name) && !is_protocol_message(&msg) {
-                                            println!("[*] 忽略非@消息({}): {} - {}", message_type, user_id, msg);
+                                        // 私聊: 消息一定是发给机器人的, 无需 @ 直接放行
+                                        // 群聊: 必须 @ 机器人, 或为 P2P 协议握手消息(同款机器人互发节点信息)
+                                        let is_private = message_type == "private";
+                                        if !is_private && !is_mentioned_bot(&event, app.my_user_id, &app.my_name) && !is_protocol_message(&msg) {
+                                            println!("[*] 忽略非@群消息({}): {} - {}", message_type, user_id, msg);
                                             continue;
                                         }
 
-                                        if message_type == "private" {
+                                        if is_private {
                                             let _ = app.send_event(BotEvent::PrivateMessage { user_id, message: msg.clone() }).await;
                                         } else if message_type == "group" {
                                             if let Some(group_id) = event.group_id {
