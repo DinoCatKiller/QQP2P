@@ -18,19 +18,29 @@ impl BotApp {
         let (node, event_rx) = P2PNode::new(user_id).await?;
         let napcat = NapCatClient::new_default().await?;
 
-        // 从登录账号信息里拿机器人昵称(用于 @ 匹配); 失败时降级为空, 不影响启动
-        let my_name = match napcat.get_login_info().await {
-            Ok(info) => info.nickname,
-            Err(e) => {
-                eprintln!("[!] 获取登录昵称失败(仅按QQ号匹配@): {e}");
-                String::new()
+        // 以 NapCat 实际登录账号为准(命令行 user-id 仅作兜底)。
+        // 若命令行传错(如填成对方QQ), @匹配和自消息过滤都会错乱, 导致收不到消息。
+        let mut my_user_id = user_id;
+        let mut my_name = String::new();
+        match napcat.get_login_info().await {
+            Ok(info) => {
+                if info.user_id != 0 {
+                    my_user_id = info.user_id;
+                }
+                my_name = info.nickname;
+                if my_user_id != user_id {
+                    println!("[+] 使用 NapCat 登录账号: {} (覆盖命令行参数 {})", my_user_id, user_id);
+                }
             }
-        };
+            Err(e) => {
+                eprintln!("[!] 获取登录信息失败(将使用命令行 user-id 作为兜底): {e}");
+            }
+        }
 
         Ok((Self {
             node: Arc::new(Mutex::new(node)),
             napcat: Arc::new(Mutex::new(napcat)),
-            my_user_id: user_id,
+            my_user_id,
             my_name,
         }, event_rx))
     }

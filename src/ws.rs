@@ -21,8 +21,13 @@ pub struct NapCatEvent {
     #[allow(dead_code)]
     #[serde(rename = "sub_type")]
     sub_type: Option<String>,
+    /// 事件所属账号(当前登录的QQ号); 用于可靠地过滤"自己发送的消息",
+    /// 避免依赖命令行传入的 user-id(该值可能是对方QQ, 曾导致误判)
+    #[serde(rename = "self_id")]
+    self_id: Option<u64>,
+    /// 消息发送者QQ号; meta_event(心跳/连接)不含此字段, 故为可选项
     #[serde(rename = "user_id")]
-    user_id: u64,
+    user_id: Option<u64>,
     #[serde(rename = "group_id")]
     group_id: Option<u64>,
     /// 原始消息全文（保留，供后续协议解析使用）
@@ -185,7 +190,16 @@ pub async fn websocket_listener(app: BotApp) -> Result<()> {
                                     println!("[WS] 解析成功 post_type={}", event.post_type);
                                     if event.post_type == "message" {
                                         let message_type = event.message_type.as_deref().unwrap_or("");
-                                        let user_id = event.user_id;
+                                        // 消息事件必带 user_id; meta_event 无此字段不会走到这里
+                                        let Some(user_id) = event.user_id else {
+                                            println!("[WS] 消息事件缺少 user_id, 忽略");
+                                            continue;
+                                        };
+                                        // 自己发出的消息不处理(以事件自带 self_id 为准, 不依赖命令行 user-id)
+                                        if event.self_id == Some(user_id) {
+                                            println!("[*] 忽略自己发送的消息({}): {} - {}", message_type, user_id, event.raw_message.as_deref().unwrap_or(""));
+                                            continue;
+                                        }
                                         let msg = extract_message_text(&event.message);
 
                                         // 只有当 @机器人(昵称取自登录账号信息) 时才触发回信
