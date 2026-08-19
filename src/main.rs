@@ -343,6 +343,14 @@ fn is_mentioned_bot(event: &NapCatEvent, my_user_id: u64, my_name: &str) -> bool
     false
 }
 
+/// P2P 协议握手消息特征: 含 "P2P节点信息", 或同时含 "公网IP" 与 "端口"
+/// 这类消息是双方机器人互发节点信息的握手协议, 允许不 @ 也能自动处理
+fn is_protocol_message(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("p2p节点信息")
+        || (lower.contains("公网ip") && lower.contains("端口"))
+}
+
 async fn websocket_listener(app: BotApp) -> Result<()> {
     let config = {
         let napcat = app.napcat.lock().await;
@@ -380,7 +388,8 @@ async fn websocket_listener(app: BotApp) -> Result<()> {
                                         let msg = extract_message_text(&event.message);
 
                                         // 只有当 @机器人(昵称取自登录账号信息) 时才触发回信
-                                        if !is_mentioned_bot(&event, app.my_user_id, &app.my_name) {
+                                        // P2P 协议握手消息(含对方节点信息)除外: 允许同款机器人互发节点信息
+                                        if !is_mentioned_bot(&event, app.my_user_id, &app.my_name) && !is_protocol_message(&msg) {
                                             println!("[*] 忽略非@消息({}): {} - {}", message_type, user_id, msg);
                                             continue;
                                         }

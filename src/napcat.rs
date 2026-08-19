@@ -71,7 +71,7 @@ impl P2PNode {
     }
 
     pub async fn get_ip_info(&self) -> String {
-        format!("🌐 我的P2P节点信息:\n📍 公网IP: {}\n🔌 端口: {}\n\n请把这个信息告诉对方",
+        format!("🌐 我的P2P节点信息:\n📍 公网IP: {}\n🔌 端口: {}\n\n请把你的信息告诉我",
             self.ip, self.port)
     }
 
@@ -184,47 +184,82 @@ impl P2PNode {
     }
 
     pub async fn parse_and_store_peer_ip(&self, user_id: u64, message: &str) -> Option<String> {
-        // 尝试从消息中解析IP:PORT
-        let parts: Vec<&str> = message.split_whitespace().collect();
-        
-        // 查找IP:PORT格式
-        for part in parts {
-            let ip_parts: Vec<&str> = part.split(':').collect();
-            if ip_parts.len() == 2 {
-                let ip = ip_parts[0];
-                if let Ok(port) = ip_parts[1].parse::<u16>() {
-                    // 验证IP格式
-                    if ip.chars().all(|c| c.is_digit(10) || c == '.') && ip.starts_with(|c: char| c.is_ascii_digit()) {
-                        let mut peer_ips = self.peer_ips.lock().await;
-                        peer_ips.insert(user_id, format!("{}:{}", ip, port));
-                        
-                        println!("[+] 记录对方IP: {} -> {}:{}", user_id, ip, port);
-                        
-                        return Some(format!("🟢 已记录你的IP: {}:{}\n🔄 正在尝试连接...", ip, port));
+        // 统一规范化: 全角冒号→半角, "公网IP"→"IP"(兼容大小写)
+        let normalized = message
+            .replace('：', ":")
+            .replace("公网IP", "IP")
+            .replace("公网ip", "IP");
+
+        let mut found_ip: Option<String> = None;
+        let mut found_port: Option<u16> = None;
+
+        // 1) 连续格式 "a.b.c.d:port"
+        for part in normalized.split_whitespace() {
+            let segs: Vec<&str> = part.split(':').collect();
+            if segs.len() == 2 && Self::is_valid_ipv4(segs[0]) {
+                if let Ok(port) = segs[1].parse::<u16>() {
+                    found_ip = Some(segs[0].to_string());
+                    found_port = Some(port);
+                }
+            }
+        }
+
+        // 2) 分行格式 "IP: x.x.x.x" + "端口: xxxx" (同款机器人互发的节点信息)
+        if found_ip.is_none() || found_port.is_none() {
+            let mut ip: Option<String> = None;
+            let mut port: Option<u16> = None;
+            for line in normalized.lines() {
+                let line = line.trim();
+                if let Some(idx) = line.find("IP:") {
+                    let candidate = line[idx + 3..].trim();
+                    if Self::is_valid_ipv4(candidate) {
+                        ip = Some(candidate.to_string());
+                    }
+                } else if let Some(idx) = line.find("端口:") {
+                    if let Ok(p) = line[idx + 3..].trim().parse::<u16>() {
+                        port = Some(p);
+                    }
+                }
+            }
+            if let (Some(i), Some(p)) = (ip, port) {
+                found_ip = Some(i);
+                found_port = Some(p);
+            }
+        }
+
+        // 3) /connect IP:PORT 格式
+        if found_ip.is_none() {
+            if let Some(idx) = normalized.find("/connect") {
+                let rest = normalized[idx + "/connect".len()..].trim();
+                if let Some(first) = rest.split_whitespace().next() {
+                    let segs: Vec<&str> = first.split(':').collect();
+                    if segs.len() == 2 && Self::is_valid_ipv4(segs[0]) {
+                        if let Ok(port) = segs[1].parse::<u16>() {
+                            found_ip = Some(segs[0].to_string());
+                            found_port = Some(port);
+                        }
                     }
                 }
             }
         }
-        
-        // 也尝试解析 /connect IP:PORT 格式
-        if message.contains("/connect") {
-            let connect_parts: Vec<&str> = message.split("/connect").collect();
-            if connect_parts.len() > 1 {
-                let ip_port = connect_parts[1].trim();
-                let ip_parts: Vec<&str> = ip_port.split(':').collect();
-                if ip_parts.len() == 2 {
-                    let ip = ip_parts[0];
-                    if let Ok(port) = ip_parts[1].parse::<u16>() {
-                        let mut peer_ips = self.peer_ips.lock().await;
-                        peer_ips.insert(user_id, format!("{}:{}", ip, port));
-                        
-                        return Some(format!("🟢 已记录你的IP: {}:{}\n🔄 正在尝试连接...", ip, port));
-                    }
-                }
-            }
+
+        if let (Some(ip), Some(port)) = (found_ip, found_port) {
+            let mut peer_ips = self.peer_ips.lock().await;
+            peer_ips.insert(user_id, format!("{}:{}", ip, port));
+
+            println!("[+] 记录对方节点: {} -> {}:{}", user_id, ip, port);
+
+            return Some(format!("🟢 已记录对方节点: {}:{}\n🔄 正在尝试连接...", ip, port));
         }
-        
+
         None
+    }
+
+    /// 简单校验 IPv4 地址: 以数字开头, 仅含数字和点
+    fn is_valid_ipv4(s: &str) -> bool {
+        !s.is_empty()
+            && s.starts_with(|c: char| c.is_ascii_digit())
+            && s.chars().all(|c| c.is_ascii_digit() || c == '.')
     }
 
     pub async fn try_auto_connect(&self, user_id: u64) {
