@@ -286,6 +286,13 @@ pub struct NapCatResponse<T> {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UserInfo {
+    #[serde(rename = "user_id")]
+    pub user_id: u64,
+    pub nickname: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FriendInfo {
     pub user_id: u64,
     pub nickname: String,
@@ -388,5 +395,16 @@ impl NapCatClient {
     pub async fn check_online(&self) -> Result<bool> {
         let url = format!("{}/get_login_info", self.base_url());
         Ok(self.client.get(&url).send().await.is_ok())
+    }
+
+    pub async fn get_login_info(&self) -> Result<UserInfo> {
+        let url = format!("{}/get_login_info", self.base_url());
+        let resp: NapCatResponse<UserInfo> = self.client.get(&url).send().await?.json().await?;
+
+        if resp.retcode != 0 {
+            anyhow::bail!("获取登录信息失败: {:?}", resp.message);
+        }
+
+        resp.data.context("登录信息为空")
     }
 }

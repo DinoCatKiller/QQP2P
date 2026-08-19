@@ -100,7 +100,9 @@ async fn main() -> Result<()> {
             
             let ip = P2PNode::get_public_ip().await?;
             println!("[+] 公网IP: {}", ip);
+            println!("[+] 机器人昵称: {}", app.my_name);
             println!("[*] 机器人已就绪!");
+            println!("[*] 仅当消息中 @{} 时才会触发回信", app.my_name);
             println!();
             println!("[*] 使用说明:");
             println!("[*]   • 对方在QQ中 @你 发送: /ip");
@@ -296,6 +298,51 @@ fn extract_message_text(value: &Option<serde_json::Value>) -> String {
     }
 }
 
+/// 判断消息是否 @ 了机器人: at 段的 QQ 号或昵称与登录账号匹配, 或纯文本 "@昵称"
+fn is_mentioned_bot(event: &NapCatEvent, my_user_id: u64, my_name: &str) -> bool {
+    let Some(message) = &event.message else {
+        return false;
+    };
+    let serde_json::Value::Array(segs) = message else {
+        return false;
+    };
+
+    let my_id_str = my_user_id.to_string();
+    for seg in segs {
+        let seg_type = seg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match seg_type {
+            "at" => {
+                // 按 @ 的 QQ 号匹配(最可靠)
+                if let Some(qq) = seg.pointer("/data/qq").and_then(|v| v.as_str()) {
+                    if qq == my_id_str {
+                        return true;
+                    }
+                }
+                // 按 @ 段携带的昵称匹配
+                if !my_name.is_empty() {
+                    if let Some(name) = seg.pointer("/data/name").and_then(|v| v.as_str()) {
+                        if name == my_name {
+                            return true;
+                        }
+                    }
+                }
+            }
+            "text" => {
+                // 纯文本 "@昵称" 形式(私聊或客户端不产生 at 段时)
+                if !my_name.is_empty() {
+                    if let Some(text) = seg.pointer("/data/text").and_then(|v| v.as_str()) {
+                        if text.contains(&format!("@{my_name}")) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 async fn websocket_listener(app: BotApp) -> Result<()> {
     let config = {
         let napcat = app.napcat.lock().await;
@@ -331,6 +378,12 @@ async fn websocket_listener(app: BotApp) -> Result<()> {
                                         let message_type = event.message_type.as_deref().unwrap_or("");
                                         let user_id = event.user_id;
                                         let msg = extract_message_text(&event.message);
+
+                                        // 只有当 @机器人(昵称取自登录账号信息) 时才触发回信
+                                        if !is_mentioned_bot(&event, app.my_user_id, &app.my_name) {
+                                            println!("[*] 忽略非@消息({}): {} - {}", message_type, user_id, msg);
+                                            continue;
+                                        }
 
                                         if message_type == "private" {
                                             let _ = app.send_event(BotEvent::PrivateMessage { user_id, message: msg.clone() }).await;
