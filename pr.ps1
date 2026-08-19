@@ -65,7 +65,10 @@ if ($branch -eq 'main') {
     } else {
         GitPull
     }
-    $name = ($m -replace '^[\w\u4e00-\u9fa5]+:\s*', '' -replace '\s+', '-')
+    # 分支名只取提交信息第一行(标题), 超长截断到 50 字符, 避免超过文件系统限制
+    $firstLine = ($m -split "`r?`n")[0]
+    $name = ($firstLine -replace '^[\w\u4e00-\u9fa5]+:\s*', '' -replace '[^\w\u4e00-\u9fa5]+', '-').Trim('-')
+    if ($name.Length -gt 50) { $name = $name.Substring(0, 50).Trim('-') }
     $branch = "feat/$name"
     git checkout -b $branch
     CheckLast
