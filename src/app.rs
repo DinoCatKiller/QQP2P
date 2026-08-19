@@ -43,22 +43,31 @@ impl BotApp {
     pub async fn handle_message(&self, sender_id: u64, raw_message: &str) -> Option<String> {
         let msg = raw_message.trim().to_lowercase();
         
-        // 检查是否是@机器人的消息（群组中）
-        // 这里简化处理，直接解析命令
-        
-        // 流程1: 对方发送 "给我一个p2p" 或类似
-        if msg.contains("给我") && msg.contains("p2p") || msg.contains("/ip") || msg == "p2p" {
+        // 流程1: 发起 P2P 握手 —— @机器人 "请给我一个p2p", 回复时 @ 对方并附上自己的节点信息
+        if msg.contains("给我") && msg.contains("p2p") || msg.contains("/p2p") {
             let node = self.node.lock().await;
-            return Some(node.get_ip_info().await);
+            let info = node.get_ip_info().await;
+            return Some(format!("[CQ:at,qq={}]{}", sender_id, info));
         }
         
-        // 流程2: 对方发送 "请你跟我这样做" 或类似
-        if msg.contains("请你") && msg.contains("跟我") || msg.contains("/请你") {
-            let _node = self.node.lock().await;
-            return Some("👋 好的，请告诉我你的P2P信息（IP:端口）\n例如: 1.2.3.4:8080".to_string());
+        // 流程2: 收到对方发来的节点信息(同款机器人协议)
+        // 解析对方IP:端口 → 自动尝试连接 → 回发自己的节点信息(@对方)
+        if msg.contains("p2p节点信息") || (msg.contains("公网ip") && msg.contains("端口")) {
+            let node = self.node.lock().await;
+            if let Some(_reply) = node.parse_and_store_peer_ip(sender_id, raw_message).await {
+                drop(node);
+                
+                // 自动尝试连接
+                let node = self.node.lock().await;
+                node.try_auto_connect(sender_id).await;
+                
+                let info = node.get_ip_info().await;
+                return Some(format!("[CQ:at,qq={}]{}", sender_id, info));
+            }
+            // 解析失败则继续往下走, 尝试其他流程
         }
         
-        // 流程3: 对方发送自己的IP信息
+        // 流程3: 对方发送自己的IP信息 (IP:端口)
         if msg.contains("ip") && msg.contains(":") || msg.contains("公网") || msg.contains("端口") {
             let node = self.node.lock().await;
             
