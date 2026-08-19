@@ -1,5 +1,26 @@
+# Rust build artifacts
 /target
+
+# Logs
 *.log
 *.err
+
+# Python
 __pycache__/
 *.pyc
+
+# Node.js (JS scripts in repo; keep npm deps out)
+node_modules/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temp files
+*.tmp
+*~
