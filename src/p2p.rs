@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use anyhow::{Result, Context};
 
+/// 握手确认回复: 收到与已记录完全相同的节点信息(ip:port)时回复此内容。
+/// 该内容不含节点信息关键词, 对方收到后不会再次触发握手, 从而终止无限互发。
+pub const HANDSHAKE_CONFIRM_REPLY: &str = "✅ 握手已确认，节点已记录，无需重复发送。";
+
 /// 对端节点信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -186,82 +190,64 @@ impl P2PNode {
     }
 
     pub async fn parse_and_store_peer_ip(&self, user_id: u64, message: &str) -> Option<String> {
-        // 统一规范化: 全角冒号→半角, "公网IP"→"IP"(兼容大小写)
-        let normalized = message
-            .replace('：', ":")
-            .replace("公网IP", "IP")
-            .replace("公网ip", "IP");
+        let normalized = normalize_node_message(message);
+        println!("[DBG] parse_and_store_peer_ip: from={} normalized={:?}", user_id, normalized);
 
-        let mut found_ip: Option<String> = None;
-        let mut found_port: Option<u16> = None;
+        let mut found: Option<(String, u16)> = None;
 
-        // 1) 连续格式 "a.b.c.d:port"
-        for part in normalized.split_whitespace() {
-            let segs: Vec<&str> = part.split(':').collect();
-            if segs.len() == 2 && Self::is_valid_ipv4(segs[0]) {
-                if let Ok(port) = segs[1].parse::<u16>() {
-                    found_ip = Some(segs[0].to_string());
-                    found_port = Some(port);
-                }
-            }
+        // 1) 前缀格式 "IP: x.x.x.x" + "端口: xxxx" (同款机器人互发的节点信息)
+        //    extract_ip_port 在整段文本上定位, 不依赖换行, 兼容真实换行/字面"\n"/单行挤压
+        if found.is_none() {
+            found = extract_ip_port(&normalized);
         }
 
-        // 2) 分行格式 "IP: x.x.x.x" + "端口: xxxx" (同款机器人互发的节点信息)
-        if found_ip.is_none() || found_port.is_none() {
-            let mut ip: Option<String> = None;
-            let mut port: Option<u16> = None;
-            for line in normalized.lines() {
-                let line = line.trim();
-                if let Some(idx) = line.find("IP:") {
-                    let candidate = line[idx + 3..].trim();
-                    if Self::is_valid_ipv4(candidate) {
-                        ip = Some(candidate.to_string());
-                    }
-                } else if let Some(idx) = line.find("端口:") {
-                    if let Ok(p) = line[idx + 3..].trim().parse::<u16>() {
-                        port = Some(p);
+        // 2) 连续格式 "a.b.c.d:port"
+        if found.is_none() {
+            for part in normalized.split_whitespace() {
+                let segs: Vec<&str> = part.split(':').collect();
+                if segs.len() == 2 && is_valid_ipv4(segs[0]) {
+                    if let Ok(port) = segs[1].parse::<u16>() {
+                        found = Some((segs[0].to_string(), port));
+                        break;
                     }
                 }
-            }
-            if let (Some(i), Some(p)) = (ip, port) {
-                found_ip = Some(i);
-                found_port = Some(p);
             }
         }
 
         // 3) /connect IP:PORT 格式
-        if found_ip.is_none() {
+        if found.is_none() {
             if let Some(idx) = normalized.find("/connect") {
                 let rest = normalized[idx + "/connect".len()..].trim();
                 if let Some(first) = rest.split_whitespace().next() {
                     let segs: Vec<&str> = first.split(':').collect();
-                    if segs.len() == 2 && Self::is_valid_ipv4(segs[0]) {
+                    if segs.len() == 2 && is_valid_ipv4(segs[0]) {
                         if let Ok(port) = segs[1].parse::<u16>() {
-                            found_ip = Some(segs[0].to_string());
-                            found_port = Some(port);
+                            found = Some((segs[0].to_string(), port));
                         }
                     }
                 }
             }
         }
 
-        if let (Some(ip), Some(port)) = (found_ip, found_port) {
-            let mut peer_ips = self.peer_ips.lock().await;
-            peer_ips.insert(user_id, format!("{}:{}", ip, port));
+        if let Some((ip, port)) = found {
+            let new_key = format!("{}:{}", ip, port);
 
+            // 防无限循环: 已记录过完全相同的节点(ip:port) → 视为握手已完成
+            // 回复内容"稍微不同"的确认消息(不含节点信息), 对方收到后不会再触发握手
+            let mut peer_ips = self.peer_ips.lock().await;
+            if peer_ips.get(&user_id) == Some(&new_key) {
+                println!("[*] 收到重复节点信息({}), 握手已完成, 回复确认(防循环)", new_key);
+                return Some(HANDSHAKE_CONFIRM_REPLY.to_string());
+            }
+
+            peer_ips.insert(user_id, new_key);
             println!("[+] 记录对方节点: {} -> {}:{}", user_id, ip, port);
 
             return Some(format!("🟢 已记录对方节点: {}:{}\n🔄 正在尝试连接...", ip, port));
         }
 
+        println!("[!] 无法从消息中解析出IP和端口: from={} msg={:?}", user_id, message);
         None
-    }
-
-    /// 简单校验 IPv4 地址: 以数字开头, 仅含数字和点
-    fn is_valid_ipv4(s: &str) -> bool {
-        !s.is_empty()
-            && s.starts_with(|c: char| c.is_ascii_digit())
-            && s.chars().all(|c| c.is_ascii_digit() || c == '.')
     }
 
     pub async fn try_auto_connect(&self, user_id: u64) {
@@ -290,5 +276,141 @@ impl P2PNode {
                 }
             }
         }
+    }
+}
+
+/// 规范化节点信息消息: 全角冒号→半角, "公网IP"/"公网ip"→"IP", 字面"\n"→真实换行
+fn normalize_node_message(message: &str) -> String {
+    message
+        .replace('：', ":")
+        .replace("\\n", "\n")
+        .replace("公网IP", "IP")
+        .replace("公网ip", "IP")
+}
+
+/// 简单校验 IPv4 地址: 以数字开头, 仅含数字和点
+fn is_valid_ipv4(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// 在整段文本上定位 "IP:" 与 "端口:", 提取其后的连续数字(和点)。
+/// 不依赖换行: 真实换行 / 字面 "\n" / 单行挤压 均可解析。
+/// 端口来源: 优先 "端口: xxxx", 其次 "IP: x.x.x.x:port" 中 IP 后紧跟的 ":port"。
+fn extract_ip_port(message: &str) -> Option<(String, u16)> {
+    let normalized = normalize_node_message(message);
+
+    // 提取 "IP:" 后的 IPv4, 并记录 IP 之后的剩余文本(用于 "IP: x.x.x.x:port" 兜底)
+    let (ip, after_ip) = normalized.find("IP:").and_then(|idx| {
+        let rest = normalized[idx + "IP:".len()..].trim_start();
+        let candidate: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if is_valid_ipv4(&candidate) {
+            // candidate 全 ASCII, len() 即字节数; rest 以 candidate 开头
+            Some((candidate.clone(), &rest[candidate.len()..]))
+        } else {
+            None
+        }
+    })?;
+
+    // 1) "端口: xxxx" —— 注意前缀是中文("端口:"=10字节), 不能用 idx+3
+    let port = normalized.find("端口:").and_then(|idx| {
+        let digits: String = normalized[idx + "端口:".len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u16>().ok()
+    });
+
+    // 2) IP 后紧跟 ":port" (如 "IP: 1.2.3.4:9000")
+    let port = port.or_else(|| {
+        let rest = after_ip.trim_start().strip_prefix(':')?;
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u16>().ok()
+    });
+
+    port.map(|p| (ip, p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 复现实际日志中的消息(字面 "\n", 被 JSON 转义后到达程序)
+    #[test]
+    fn test_extract_from_real_log_literal_newline() {
+        let msg = "🌐 我的P2P节点信息:\\n📍 公网IP: 54.251.93.8\\n🔌 端口: 8080\\n\\n请把你的信息告诉我";
+        let normalized = normalize_node_message(msg);
+        eprintln!("[DBG-T] normalized={:?}", normalized);
+        eprintln!("[DBG-T] find(IP:)={:?} find(端口:)={:?}", normalized.find("IP:"), normalized.find("端口:"));
+        let got = extract_ip_port(msg);
+        assert_eq!(got, Some(("54.251.93.8".to_string(), 8080)));
+    }
+
+    /// 真实换行版本(对方程序直接拼接 \n)
+    #[test]
+    fn test_extract_from_real_log_real_newline() {
+        let msg = "🌐 我的P2P节点信息:\n📍 公网IP: 54.251.93.8\n🔌 端口: 8080\n\n请把你的信息告诉我";
+        let got = extract_ip_port(msg);
+        assert_eq!(got, Some(("54.251.93.8".to_string(), 8080)));
+    }
+
+    /// 单行挤压格式
+    #[test]
+    fn test_extract_single_line() {
+        let msg = "我的P2P节点信息: 公网IP: 1.2.3.4 端口: 9000 请把你的信息告诉我";
+        let got = extract_ip_port(msg);
+        assert_eq!(got, Some(("1.2.3.4".to_string(), 9000)));
+    }
+
+    /// 连续格式 "IP:PORT"
+    #[test]
+    fn test_extract_compact() {
+        let msg = "IP: 1.2.3.4:9000";
+        let got = extract_ip_port(msg);
+        assert_eq!(got, Some(("1.2.3.4".to_string(), 9000)));
+    }
+
+    /// 缺少端口时应返回 None
+    #[test]
+    fn test_extract_missing_port() {
+        let msg = "IP: 1.2.3.4 没有端口";
+        let got = extract_ip_port(msg);
+        assert_eq!(got, None);
+    }
+
+    /// 防无限循环: 相同节点信息(ip:port)重复收到时, 回复内容"不同"的确认消息,
+    /// 不再触发对方继续回复; 端口变化(如重启后端口改变)仍允许重新握手
+    #[tokio::test]
+    async fn test_duplicate_peer_info_skips_reply() {
+        let (event_tx, _) = broadcast::channel(10);
+        let node = P2PNode {
+            user_id: 1,
+            ip: "1.2.3.4".to_string(),
+            port: 9000,
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            peer_ips: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: Arc::new(Mutex::new(event_tx)),
+        };
+        let msg = "🌐 我的P2P节点信息:\n📍 公网IP: 8.8.8.8\n🔌 端口: 8080\n\n请把你的信息告诉我";
+
+        // 第一次: 新节点, 记录并回复节点信息(非确认消息)
+        let first = node.parse_and_store_peer_ip(100, msg).await;
+        assert!(first.is_some());
+        assert_ne!(first.as_deref(), Some(HANDSHAKE_CONFIRM_REPLY));
+
+        // 第二次相同内容: 视为重复 → 回复确认消息(内容不同), 防无限互发
+        let second = node.parse_and_store_peer_ip(100, msg).await;
+        assert_eq!(second.as_deref(), Some(HANDSHAKE_CONFIRM_REPLY));
+
+        // 端口变化: 视为新节点, 允许重新握手
+        let msg2 = "🌐 我的P2P节点信息:\n📍 公网IP: 8.8.8.8\n🔌 端口: 8081\n\n请把你的信息告诉我";
+        let third = node.parse_and_store_peer_ip(100, msg2).await;
+        assert!(third.is_some());
+        assert_ne!(third.as_deref(), Some(HANDSHAKE_CONFIRM_REPLY));
     }
 }
