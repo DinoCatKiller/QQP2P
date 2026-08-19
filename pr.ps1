@@ -10,11 +10,27 @@
 #   - 任何 git 命令失败立即停止, 本地代码不会丢
 
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$m
+    [string]$m,
+    [string]$msgFile
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 消息来源: 优先用 -msgFile 从 UTF-8 BOM 文件读取(避免中文经命令行传递乱码), 读完即删
+if ($msgFile) {
+    if (-not (Test-Path $msgFile)) {
+        Write-Host "找不到消息文件: $msgFile" -ForegroundColor Red
+        exit 1
+    }
+    $m = Get-Content -Path $msgFile -Raw -Encoding UTF8
+    $m = $m.Trim()
+    Remove-Item $msgFile -Force -ErrorAction SilentlyContinue
+}
+
+if ([string]::IsNullOrWhiteSpace($m)) {
+    Write-Host '用法: ./pr.ps1 -m "fix: xxx"   或   ./pr.ps1 -msgFile <消息文件>' -ForegroundColor Yellow
+    exit 1
+}
 
 function CheckLast {
     if ($LASTEXITCODE -ne 0) {
