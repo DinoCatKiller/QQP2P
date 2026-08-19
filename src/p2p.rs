@@ -74,8 +74,7 @@ impl P2PNode {
     }
 
     pub async fn get_ip_info(&self) -> String {
-        format!("🌐 我的P2P节点信息:\n📍 公网IP: {}\n🔌 端口: {}\n\n请把你的信息告诉我",
-            self.ip, self.port)
+        format!("🌐 我的P2P节点信息:\n📍 公网IP: {}\n🔌 端口: {}", self.ip, self.port)
     }
 
     pub async fn send_event(&self, event: BotEvent) {
@@ -343,7 +342,7 @@ mod tests {
     /// 复现实际日志中的消息(字面 "\n", 被 JSON 转义后到达程序)
     #[test]
     fn test_extract_from_real_log_literal_newline() {
-        let msg = "🌐 我的P2P节点信息:\\n📍 公网IP: 54.251.93.8\\n🔌 端口: 8080\\n\\n请把你的信息告诉我";
+        let msg = "🌐 我的P2P节点信息:\\n📍 公网IP: 54.251.93.8\\n🔌 端口: 8080";
         let normalized = normalize_node_message(msg);
         eprintln!("[DBG-T] normalized={:?}", normalized);
         eprintln!("[DBG-T] find(IP:)={:?} find(端口:)={:?}", normalized.find("IP:"), normalized.find("端口:"));
@@ -354,7 +353,7 @@ mod tests {
     /// 真实换行版本(对方程序直接拼接 \n)
     #[test]
     fn test_extract_from_real_log_real_newline() {
-        let msg = "🌐 我的P2P节点信息:\n📍 公网IP: 54.251.93.8\n🔌 端口: 8080\n\n请把你的信息告诉我";
+        let msg = "🌐 我的P2P节点信息:\n📍 公网IP: 54.251.93.8\n🔌 端口: 8080";
         let got = extract_ip_port(msg);
         assert_eq!(got, Some(("54.251.93.8".to_string(), 8080)));
     }
@@ -396,7 +395,7 @@ mod tests {
             peer_ips: Arc::new(Mutex::new(HashMap::new())),
             event_tx: Arc::new(Mutex::new(event_tx)),
         };
-        let msg = "🌐 我的P2P节点信息:\n📍 公网IP: 8.8.8.8\n🔌 端口: 8080\n\n请把你的信息告诉我";
+        let msg = "🌐 我的P2P节点信息:\n📍 公网IP: 8.8.8.8\n🔌 端口: 8080";
 
         // 第一次: 新节点, 记录并回复节点信息(非确认消息)
         let first = node.parse_and_store_peer_ip(100, msg).await;
