@@ -135,10 +135,16 @@ pub async fn run_message_handler(app: BotApp, mut event_rx: tokio::sync::broadca
                 // 同上: 不再按命令行 user-id 过滤
                 println!("[*] 收到群消息: {} - {}", user_id, message);
 
-                if let Some(reply) = app.handle_message(user_id, &message).await {
-                    if let Err(e) = app.send_group_reply(group_id, &reply).await {
-                        eprintln!("[!] 发送群消息失败: {}", e);
+                match app.handle_message(user_id, &message).await {
+                    Some(reply) => {
+                        println!("[DBG] handle_message 返回回复: {:?}", reply);
+                        if let Err(e) = app.send_group_reply(group_id, &reply).await {
+                            eprintln!("[!] 发送群消息失败: {}", e);
+                        } else {
+                            println!("[DBG] 群消息回复已发送 group={}", group_id);
+                        }
                     }
+                    None => println!("[DBG] handle_message 返回 None(无回复)"),
                 }
             }
             Ok(BotEvent::Connected { user_id }) => {

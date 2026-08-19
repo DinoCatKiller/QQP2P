@@ -52,9 +52,11 @@ impl BotApp {
 
     pub async fn handle_message(&self, sender_id: u64, raw_message: &str) -> Option<String> {
         let msg = raw_message.trim().to_lowercase();
+        println!("[DBG] handle_message: from={} raw={:?} lower={:?}", sender_id, raw_message, msg);
         
         // 流程1: 发起 P2P 握手 —— @机器人 "请给我一个p2p", 回复时 @ 对方并附上自己的节点信息
         if msg.contains("给我") && msg.contains("p2p") || msg.contains("/p2p") {
+            println!("[DBG] 流程1命中(给我p2p)");
             let node = self.node.lock().await;
             let info = node.get_ip_info().await;
             return Some(format!("[CQ:at,qq={}]{}", sender_id, info));
@@ -62,19 +64,33 @@ impl BotApp {
         
         // 流程2: 收到对方发来的节点信息(同款机器人协议)
         // 解析对方IP:端口 → 自动尝试连接 → 回发自己的节点信息(@对方)
+        // 重复节点信息(握手确认): 直接回复确认消息, 不回发节点信息, 终止无限互发
         if msg.contains("p2p节点信息") || (msg.contains("公网ip") && msg.contains("端口")) {
+            println!("[DBG] 流程2命中(P2P节点信息)");
             let node = self.node.lock().await;
-            if let Some(_reply) = node.parse_and_store_peer_ip(sender_id, raw_message).await {
-                drop(node);
-                
-                // 自动尝试连接
-                let node = self.node.lock().await;
-                node.try_auto_connect(sender_id).await;
-                
-                let info = node.get_ip_info().await;
-                return Some(format!("[CQ:at,qq={}]{}", sender_id, info));
+            match node.parse_and_store_peer_ip(sender_id, raw_message).await {
+                Some(reply) if reply == crate::p2p::HANDSHAKE_CONFIRM_REPLY => {
+                    // 重复节点(ip:port 与已记录相同) → 握手完成, 回复确认(内容不同), 不再回发节点信息
+                    println!("[DBG] 收到重复节点信息, 握手完成, 回复确认(防循环)");
+                    return Some(format!("[CQ:at,qq={}]{}", sender_id, reply));
+                }
+                Some(_reply) => {
+                    println!("[DBG] parse_and_store_peer_ip 成功, 尝试自动连接");
+                    drop(node);
+
+                    // 自动尝试连接
+                    let node = self.node.lock().await;
+                    node.try_auto_connect(sender_id).await;
+                    println!("[DBG] try_auto_connect 完成");
+
+                    let info = node.get_ip_info().await;
+                    return Some(format!("[CQ:at,qq={}]{}", sender_id, info));
+                }
+                None => {
+                    println!("[DBG] parse_and_store_peer_ip 返回None, 继续往下");
+                    // 解析失败则继续往下走, 尝试其他流程
+                }
             }
-            // 解析失败则继续往下走, 尝试其他流程
         }
         
         // 流程3: 对方发送自己的IP信息 (IP:端口)
