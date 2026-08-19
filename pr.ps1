@@ -69,14 +69,15 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 合并 PR (有冲突时 gh 会失败, 去 GitHub 网页解决)
-gh pr merge --merge --yes
+# 注意: gh 新版本已移除 --yes, 指定 --merge 后不会再询问, 直接合并
+gh pr merge --merge
 if ($LASTEXITCODE -ne 0) {
     Write-Host @"
 合并失败, 通常是 PR 有冲突。处理方式:
   1. 打开 PR 页面, 点 "Resolve conflicts" 在 GitHub 网页上逐文件解决
   2. 解决完点 "Mark as resolved" 和 "Commit merge"
   3. 然后手动收尾:
-       gh pr merge --merge --yes
+       gh pr merge --merge
        git checkout main
        git pull
        git branch -d <分支名>
