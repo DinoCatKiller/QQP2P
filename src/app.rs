@@ -3,7 +3,7 @@ use tokio::sync::Mutex;
 use anyhow::Result;
 
 use crate::napcat::NapCatClient;
-use crate::napcat::P2PNode;
+use crate::p2p::P2PNode;
 
 #[derive(Clone)]
 pub struct BotApp {
@@ -14,7 +14,7 @@ pub struct BotApp {
 }
 
 impl BotApp {
-    pub async fn new(user_id: u64) -> Result<(Self, tokio::sync::broadcast::Receiver<crate::napcat::BotEvent>)> {
+    pub async fn new(user_id: u64) -> Result<(Self, tokio::sync::broadcast::Receiver<crate::p2p::BotEvent>)> {
         let (node, event_rx) = P2PNode::new(user_id).await?;
         let napcat = NapCatClient::new_default().await?;
 
@@ -35,7 +35,7 @@ impl BotApp {
         }, event_rx))
     }
 
-    pub async fn send_event(&self, event: crate::napcat::BotEvent) {
+    pub async fn send_event(&self, event: crate::p2p::BotEvent) {
         let node = self.node.lock().await;
         node.send_event(event).await;
     }
@@ -98,7 +98,7 @@ impl BotApp {
                             Ok(result) => {
                                 // 添加到peers
                                 let mut peers = node.peers.lock().await;
-                                peers.insert(sender_id, crate::napcat::PeerInfo {
+                                peers.insert(sender_id, crate::p2p::PeerInfo {
                                     user_id: sender_id,
                                     ip: ip.to_string(),
                                     port,

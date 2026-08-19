@@ -159,10 +159,17 @@ cargo run -- groups
 
 ```
 src/
-├── main.rs    # CLI入口
-├── napcat.rs  # NapCat API + P2P核心
-└── app.rs     # 消息处理
+├── main.rs    # CLI 入口 + 任务装配
+├── app.rs     # BotApp 消息处理
+├── napcat.rs  # NapCat HTTP API 客户端
+├── p2p.rs     # P2P 节点（TCP 直连、节点信息交换）
+└── ws.rs      # WebSocket 事件监听与消息分发
+
+scripts/       # 运行/维护脚本（start、run、check、stop 等）
+docs/          # 文档（PHONE_GUIDE 使用指南、P2P_HOLE_PUNCHING 打洞方案）
 ```
+
+> P2P 打洞（NAT 穿越）方案详见 `docs/P2P_HOLE_PUNCHING.md`，M1 实现将新增 `src/holepunch.rs`。
 
 ## 注意事项
 
