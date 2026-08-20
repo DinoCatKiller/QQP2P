@@ -93,11 +93,20 @@ pub struct P2PNode {
 impl P2PNode {
     pub async fn new(user_id: u64) -> Result<(Self, broadcast::Receiver<BotEvent>)> {
         let ip = Self::get_public_ip().await?;
+        Ok(Self::new_with_ip(user_id, ip))
+    }
+
+    /// 构造节点但不查询公网 IP（供 `holepunch` 等仅需 UDP 打洞、不依赖外网 IP 的命令使用）
+    pub async fn new_offline(user_id: u64) -> Result<(Self, broadcast::Receiver<BotEvent>)> {
+        Ok(Self::new_with_ip(user_id, "0.0.0.0".to_string()))
+    }
+
+    fn new_with_ip(user_id: u64, ip: String) -> (Self, broadcast::Receiver<BotEvent>) {
         let (event_tx, event_rx) = broadcast::channel(100);
 
-        Ok((Self {
+        (Self {
             user_id,
-            ip: ip.clone(),
+            ip,
             port: 0,
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_ips: Arc::new(Mutex::new(HashMap::new())),
@@ -107,7 +116,7 @@ impl P2PNode {
             my_mapped: None,
             hole_sessions: Arc::new(Mutex::new(HashMap::new())),
             event_tx: Arc::new(Mutex::new(event_tx)),
-        }, event_rx))
+        }, event_rx)
     }
 
     pub async fn get_public_ip() -> Result<String> {
@@ -212,8 +221,8 @@ impl P2PNode {
             n.stun_server = Some(stun_server);
         }
 
-        // 启动时查询一次 STUN, 缓存本机映射(供 get_ip_info 附带打洞行)
-        match crate::holepunch::query_mapped_addr(&sock, stun_server).await {
+        // 启动时查询一次 STUN(带重试), 缓存本机映射(供 get_ip_info 附带打洞行)
+        match crate::holepunch::query_mapped_addr_retry(&sock, stun_server).await {
             Ok(m) => {
                 println!("[+] 本机STUN映射地址: {}", m);
                 let mut n = node.lock().await;

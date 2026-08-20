@@ -110,6 +110,30 @@ cargo run -- friends
 cargo run -- groups
 ```
 
+### UDP 打洞联调（绕开 QQ 信令）
+
+两个进程/两台机器不经过 QQ，直接命令行互相打洞：
+
+```bash
+# 进程A: 直接指定对方映射地址, wait 秒后同时开跑
+cargo run -- holepunch --port 8080 --peer-uid 2 --peer-mapped "B的ip:port" --wait 15
+
+# 进程B: 不传 --peer-mapped, 启动后从 stdin 输入对方映射地址(回车即打洞)
+cargo run -- holepunch --port 8081 --peer-uid 1
+```
+
+参数说明：
+
+| 参数 | 说明 |
+|------|------|
+| `--port` | UDP 打洞监听端口，两个进程必须不同 |
+| `--peer-uid` | 对端标识（本机会话表 key，可任意填，仅日志用） |
+| `--peer-mapped` | 对方 NAT 映射地址 `ip:port`；不填则等待 stdin 输入 |
+| `--wait` | 未指定 `--peer-mapped` 时等待 stdin 输入的秒数上限（默认 15） |
+| `--stun` | STUN 服务器（默认 `stun.l.google.com:19302`） |
+
+上帝视角用法：两个终端各跑一条命令（不传 `--peer-mapped`），两边都打印出自己的映射地址后，把对方地址粘贴进另一个终端回车，双方立即同时开打。
+
 ## 完整对话示例
 
 **A发送：**

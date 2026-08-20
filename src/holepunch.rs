@@ -163,6 +163,23 @@ pub async fn query_mapped_addr(sock: &UdpSocket, stun_server: SocketAddr) -> Res
     }
 }
 
+/// STUN 查询带重试：网络抖动导致单次超时/丢包时最多尝试 3 次，间隔 500ms。
+/// 同样遵循映射一致性（使用传入的同一 socket）。
+pub async fn query_mapped_addr_retry(sock: &UdpSocket, stun_server: SocketAddr) -> Result<SocketAddr> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=3 {
+        match query_mapped_addr(sock, stun_server).await {
+            Ok(m) => return Ok(m),
+            Err(e) => {
+                eprintln!("[!] STUN 查询失败(第{}次): {}", attempt, e);
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("STUN 查询失败")))
+}
+
 /// 从节点信息消息中提取对方打洞映射与会话 ID。
 /// 格式示例: `📡 P2P打洞: udp://1.2.3.4:54321 会话=123456789`
 /// 返回 (映射地址, 会话ID)；未附带打洞行或格式无效时返回 None。
@@ -215,7 +232,19 @@ pub async fn run_udp_listener(node: Arc<Mutex<P2PNode>>) -> Result<()> {
 
     let mut buf = [0u8; 1500];
     loop {
-        let (n, src) = sock.recv_from(&mut buf).await?;
+        let (n, src) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Windows: 对端 UDP 端口已关闭(ICMP)时 recv_from 报 10054(ConnectionReset),
+                // 且错误状态粘滞。这在打洞场景属异常(对端退出), 不崩监听循环, 稍候重试
+                if e.kind() == std::io::ErrorKind::ConnectionReset {
+                    eprintln!("[!] UDP收到ICMP重置(10054), 监听循环继续");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                anyhow::bail!("UDP监听循环退出: {}", e);
+            }
+        };
         let line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
         if let Some(rest) = line.strip_prefix(PROBE_PREFIX) {
@@ -297,20 +326,34 @@ pub async fn start_hole_punch(
         return;
     };
 
-    // 查询 STUN 获取最新映射（同一 socket，映射一致性）
-    let my_mapped = match query_mapped_addr(&sock, stun_server).await {
+    // 查询 STUN 获取最新映射（同一 socket，映射一致性，带重试）。
+    // 刷新失败时降级使用启动时缓存的映射（同一 socket 查询所得，一致性仍成立），
+    // 避免 STUN 抖动导致打洞整体失败。
+    let my_mapped = match query_mapped_addr_retry(&sock, stun_server).await {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[!] STUN 查询失败, 打洞终止: {}", e);
-            send_result_event(
-                &node,
-                peer_user_id,
-                false,
-                None,
-                format!("❌ UDP打洞失败: STUN 查询失败 ({})", e),
-            )
-            .await;
-            return;
+            let cached = {
+                let n = node.lock().await;
+                n.my_mapped
+            };
+            match cached {
+                Some(m) => {
+                    eprintln!("[!] STUN 刷新失败({}), 降级使用缓存映射 {}", e, m);
+                    m
+                }
+                None => {
+                    eprintln!("[!] STUN 查询失败, 打洞终止: {}", e);
+                    send_result_event(
+                        &node,
+                        peer_user_id,
+                        false,
+                        None,
+                        format!("❌ UDP打洞失败: STUN 查询失败 ({})", e),
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
     };
     // 刷新缓存（供 get_ip_info 输出最新映射）
