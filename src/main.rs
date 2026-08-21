@@ -77,6 +77,15 @@ enum Commands {
         #[arg(long, default_value = "15")]
         wait: u64,
     },
+    /// 仅查询本机NAT映射地址(公网IP:端口), 查完即退
+    Mapped {
+        /// 本地UDP端口(0=系统自动分配)
+        #[arg(short, long, default_value = "0")]
+        port: u16,
+        /// STUN服务器地址
+        #[arg(long, default_value = "stun.l.google.com:19302")]
+        stun: String,
+    },
     /// 查看连接状态
     Status {
         #[arg(short, long, default_value = "12345")]
@@ -281,6 +290,15 @@ async fn main() -> Result<()> {
                 println!("[*] 打洞成功, 保持 3 秒供对端确认...");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
+            Ok(())
+        }
+
+        Commands::Mapped { port, stun } => {
+            // 绑定 UDP → 查一次 STUN → 打印 ip:port → 直接退出（不做任何打洞动作）
+            let stun_addr = crate::holepunch::resolve_stun_server(&stun).await?;
+            let sock = tokio::net::UdpSocket::bind(("0.0.0.0", port)).await?;
+            let mapped = crate::holepunch::query_mapped_addr_retry(&sock, stun_addr).await?;
+            println!("{}", mapped);
             Ok(())
         }
 
