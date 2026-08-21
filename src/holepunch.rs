@@ -56,7 +56,9 @@ const MAX_PROBES: usize = 50;
 /// 打洞重试轮间隔（一轮未连通后等待再试）
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
-/// 将 `stun.l.google.com:19302` 形式的字符串解析为 SocketAddr（域名走 DNS 查询）
+/// 将 `stun.l.google.com:19302` 形式的字符串解析为 SocketAddr（域名走 DNS 查询）。
+/// 由于 UDP socket 绑定在 0.0.0.0（IPv4-only），域名解析时强制过滤 IPv6，
+/// 避免 `stun.l.google.com` 优先解析出 AAAA 记录导致 send_to 地址族不匹配而失败。
 pub async fn resolve_stun_server(s: &str) -> Result<SocketAddr> {
     if let Ok(addr) = s.parse::<SocketAddr>() {
         return Ok(addr);
@@ -64,7 +66,9 @@ pub async fn resolve_stun_server(s: &str) -> Result<SocketAddr> {
     let (host, port) = s.rsplit_once(':').context("STUN 地址格式应为 host:port")?;
     let port: u16 = port.parse().context("STUN 端口无效")?;
     let mut addrs = tokio::net::lookup_host((host, port)).await?;
-    addrs.next().context("STUN 域名解析失败")
+    addrs
+        .find(|a| a.is_ipv4())
+        .context("STUN 域名解析失败(无 IPv4 记录)")
 }
 
 /// 构造 STUN Binding Request（20 字节 header，Length=0）
