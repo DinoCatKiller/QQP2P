@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -206,7 +207,13 @@ impl P2PNode {
 
     /// 启动 UDP 打洞服务：绑定 UDP socket、查询 STUN 缓存映射地址、监听打洞报文。
     /// socket 全程共享，STUN 查询与打洞发包使用同一 socket（映射一致性）。
-    pub async fn start_udp_server(node: Arc<Mutex<P2PNode>>, port: u16, stun_server: SocketAddr) -> Result<()> {
+    /// `keepalive_interval` 为后台保活周期(周期性向 STUN 发包维持 NAT 映射), 0 表示禁用保活。
+    pub async fn start_udp_server(
+        node: Arc<Mutex<P2PNode>>,
+        port: u16,
+        stun_server: SocketAddr,
+        keepalive_interval: Duration,
+    ) -> Result<()> {
         let sock = Arc::new(
             UdpSocket::bind(("0.0.0.0", port))
                 .await
@@ -240,6 +247,14 @@ impl P2PNode {
                 eprintln!("[!] UDP监听循环退出: {}", e);
             }
         });
+
+        // 后台保活: 周期性向 STUN 发包, 维持 NAT 映射不超时(等待/信令交换期间地址长期有效)
+        if !keepalive_interval.is_zero() {
+            let node3 = Arc::clone(&node);
+            tokio::spawn(async move {
+                crate::holepunch::keepalive_loop(node3, keepalive_interval).await;
+            });
+        }
 
         Ok(())
     }

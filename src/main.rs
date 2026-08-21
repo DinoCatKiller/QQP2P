@@ -67,15 +67,18 @@ enum Commands {
         /// 对端标识（本机会话表key，可任意填，仅用于日志）
         #[arg(long, default_value = "2")]
         peer_uid: u64,
-        /// 对方NAT映射地址 (ip:port)。不填则等待从 stdin 输入
+        /// 对方NAT映射地址 (ip:port)。作为交互输入的默认值, 启动后回车即采用, 也可输入新地址覆盖
         #[arg(long)]
         peer_mapped: Option<String>,
         /// STUN服务器地址
         #[arg(long, default_value = "stun.l.google.com:19302")]
         stun: String,
-        /// 未指定 --peer-mapped 时, 等待 stdin 输入的秒数上限
-        #[arg(long, default_value = "15")]
-        wait: u64,
+        /// 打洞重试轮数上限(0=无限重试直到连通)
+        #[arg(long, default_value = "0")]
+        retry: u32,
+        /// 映射保活间隔(秒), 周期性向STUN发包维持NAT映射不超时(0=禁用保活)
+        #[arg(long, default_value = "20")]
+        keepalive: u64,
     },
     /// 仅查询本机NAT映射地址(公网IP:端口), 查完即退
     Mapped {
@@ -147,12 +150,19 @@ async fn main() -> Result<()> {
                 P2PNode::start_tcp_server(app_clone, port).await
             });
 
-            // UDP 打洞服务：解析 STUN 地址 → 绑定 UDP → 查询映射 → 监听打洞报文
+            // UDP 打洞服务：解析 STUN 地址 → 绑定 UDP → 查询映射 → 监听打洞报文 + 后台保活
             let udp_app = Arc::clone(&app.node);
             tokio::spawn(async move {
                 match crate::holepunch::resolve_stun_server(&stun).await {
                     Ok(srv) => {
-                        if let Err(e) = P2PNode::start_udp_server(udp_app, udp_port, srv).await {
+                        if let Err(e) = P2PNode::start_udp_server(
+                            udp_app,
+                            udp_port,
+                            srv,
+                            Duration::from_secs(20),
+                        )
+                        .await
+                        {
                             eprintln!("[!] UDP打洞服务启动失败: {}", e);
                         }
                     }
@@ -206,7 +216,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Holepunch { port, peer_uid, peer_mapped, stun, wait } => {
+        Commands::Holepunch { port, peer_uid, peer_mapped, stun, retry, keepalive } => {
             println!("[*] 命令行UDP打洞 (绕开QQ信令)");
             println!("[*] UDP端口: {}", port);
             println!("[*] 对端标识: {}", peer_uid);
@@ -215,12 +225,21 @@ async fn main() -> Result<()> {
             let (node, mut event_rx) = P2PNode::new_offline(peer_uid).await?;
             let node = Arc::new(Mutex::new(node));
 
-            // 解析 STUN → 绑定 UDP → 查询映射 → 后台监听打洞报文
+            // 解析 STUN → 绑定 UDP → 查询映射 → 后台监听打洞报文 + 后台保活(维持映射不超时)
             let stun_addr = crate::holepunch::resolve_stun_server(&stun).await?;
             println!("[*] STUN服务器: {}", stun_addr);
-            P2PNode::start_udp_server(Arc::clone(&node), port, stun_addr).await?;
+            P2PNode::start_udp_server(
+                Arc::clone(&node),
+                port,
+                stun_addr,
+                Duration::from_secs(keepalive),
+            )
+            .await?;
+            if keepalive > 0 {
+                println!("[*] 保活已启动(每 {} 秒刷新映射, 等待/重试期间地址长期有效)", keepalive);
+            }
 
-            // 打印我方映射地址，等待对方同步
+            // 打印我方映射地址
             let my_mapped = {
                 let n = node.lock().await;
                 n.my_mapped
@@ -230,42 +249,58 @@ async fn main() -> Result<()> {
                 None => eprintln!("[!] 我方映射地址获取失败"),
             }
 
-            // 对方地址来源：--peer-mapped 参数，或等待 stdin 输入（上帝视角两个终端互填）
-            let peer_addr: SocketAddr = if let Some(pm) = peer_mapped {
-                println!("[*] 对方映射地址: {}", pm);
-                pm.parse()
-                    .map_err(|_| anyhow::anyhow!("对方映射地址格式应为 ip:port, 收到: {}", pm))?
-            } else {
-                println!("[*] 请输入对方映射地址(ip:port)后回车, {} 秒内有效:", wait);
+            // 对方地址来源：--peer-mapped 作为默认值; 启动后无限期等待 stdin 输入(不输入则一直保活)
+            let peer_addr: SocketAddr = loop {
+                let hint = match &peer_mapped {
+                    Some(pm) => format!("(默认 {}, 直接回车采用)", pm),
+                    None => String::from("(留空则继续等待)"),
+                };
+                println!("[*] 请输入对方映射地址(ip:port)后回车 {}:", hint);
                 let mut input = String::new();
                 let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-                let read = stdin.read_line(&mut input);
-                tokio::pin!(read);
-                let timeout = tokio::time::sleep(Duration::from_secs(wait));
-                tokio::pin!(timeout);
-                tokio::select! {
-                    res = &mut read => {
-                        res.context("读取输入失败")?;
-                        let s = input.trim();
-                        if s.is_empty() {
-                            anyhow::bail!("输入为空, 退出");
-                        }
-                        println!("[*] 对方映射地址: {}", s);
-                        s.parse()
-                            .map_err(|_| anyhow::anyhow!("对方映射地址格式应为 ip:port, 收到: {}", s))?
+                stdin
+                    .read_line(&mut input)
+                    .await
+                    .context("读取输入失败")?;
+                let s = input.trim();
+                if s.is_empty() {
+                    if let Some(pm) = &peer_mapped {
+                        println!("[*] 采用默认对方映射地址: {}", pm);
+                        break pm.parse().map_err(|_| {
+                            anyhow::anyhow!("对方映射地址格式应为 ip:port, 收到: {}", pm)
+                        })?;
                     }
-                    _ = &mut timeout => {
-                        anyhow::bail!("等待对方地址超时({}秒), 退出", wait);
+                    println!("[*] 输入为空, 继续等待(保活中, Ctrl+C 退出)...");
+                    continue;
+                }
+                match s.parse::<SocketAddr>() {
+                    Ok(addr) => {
+                        println!("[*] 对方映射地址: {}", addr);
+                        break addr;
+                    }
+                    Err(_) => {
+                        eprintln!("[!] 地址格式应为 ip:port, 收到: {}", s);
+                        continue;
                     }
                 }
             };
-            println!("[*] 开始打洞（后台发包约10秒）...");
+            println!(
+                "[*] 开始打洞(每轮约10秒, 未连通自动重试{}轮, Ctrl+C 退出)...",
+                if retry == 0 {
+                    "∞".to_string()
+                } else {
+                    format!("上限{}", retry)
+                }
+            );
 
-            // 启动打洞（内部刷新STUN映射 + 后台发包约10秒）
-            crate::holepunch::start_hole_punch(Arc::clone(&node), peer_uid, peer_addr).await;
+            // 后台持续打洞: 0 表示无限重试直到连通(每轮刷新映射, 探测包携带最新地址)
+            let punch_node = Arc::clone(&node);
+            tokio::spawn(async move {
+                crate::holepunch::start_hole_punch_retry(punch_node, peer_uid, peer_addr, retry)
+                    .await;
+            });
 
-            // 等待打洞结果事件，打印并退出
-            let mut success = false;
+            // 事件循环: 打洞成功→保持监听(等对端也完成); 失败(重试轮数用尽)→退出; Ctrl+C→退出
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
@@ -274,21 +309,20 @@ async fn main() -> Result<()> {
                     }
                     ev = event_rx.recv() => {
                         match ev {
-                            Ok(BotEvent::HolePunchResult { detail, success: ok, .. }) => {
+                            Ok(BotEvent::HolePunchResult { detail, success, .. }) => {
                                 println!("{}", detail);
-                                success = ok;
-                                break;
+                                if success {
+                                    println!("[*] 已连通, 保持监听中(Ctrl+C 退出)...");
+                                } else {
+                                    println!("[!] 打洞失败, 退出");
+                                    break;
+                                }
                             }
                             Ok(_) => {}
                             Err(_) => break,
                         }
                     }
                 }
-            }
-            if success {
-                // 成功后保持数秒，给对端留出完成 ACK 确认的时间
-                println!("[*] 打洞成功, 保持 3 秒供对端确认...");
-                tokio::time::sleep(Duration::from_secs(3)).await;
             }
             Ok(())
         }
