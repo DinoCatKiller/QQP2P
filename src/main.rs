@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
                 let _ = start_transport(port).await;
             });
 
-            let app_clone = Arc::clone(&app.node);
+            let _app_clone = Arc::clone(&app.node);
             let tcp_handle = tokio::spawn(async move {
                 // P2PNode::start_tcp_server(app_clone, port).await
                 println!("[*] TCP 服务器由 libp2p 传输层处理 (N1 阶段)");
@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
             println!("[*] 监听端口: {}", port);
 
             // 初始化 libp2p 传输层
-            let (swarm, listen_multiaddr, peer_id) = start_transport(port).await?;
+            let (_swarm, listen_multiaddr, peer_id) = start_transport(port).await?;
 
             println!("[*] 本地 PeerId: {}", peer_id);
             println!("[*] 监听地址: {}", listen_multiaddr);

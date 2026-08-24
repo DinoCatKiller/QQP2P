@@ -6,6 +6,8 @@
 //! - 对等节点连接与发现
 //! - 消息发送（DATA 帧）
 
+#![allow(dead_code)]
+
 use futures_util::StreamExt;
 use libp2p::swarm::Swarm;
 use libp2p::{Multiaddr, PeerId};

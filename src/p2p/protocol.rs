@@ -5,6 +5,8 @@
 //! 将 TUN 数据包与控制消息复用在同一条 libp2p connection 上。
 //! 控制帧走 reliable stream，数据帧优先走 datagram（尽力而为）。
 
+#![allow(dead_code)]
+
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 
