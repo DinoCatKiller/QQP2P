@@ -18,5 +18,4 @@ mod protocol;
 mod service;
 
 pub use transport::start_transport;
-pub use protocol::{MessageType, TunProtocolHandler, HelloMsg, JoinAckMsg, MemberInfo, DataMsg, encode_frame, decode_frame};
 pub use service::P2pService;

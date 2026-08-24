@@ -64,6 +64,7 @@ pub async fn start_transport(
 }
 
 /// 将多地址转换为字符串便于打印
+#[allow(dead_code)]
 pub fn format_multiaddr(addr: &Multiaddr) -> String {
     addr.to_string()
 }
