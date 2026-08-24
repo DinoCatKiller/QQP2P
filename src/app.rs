@@ -79,29 +79,9 @@ impl BotApp {
                     drop(node);
 
                     // 自动尝试连接(TCP)
-                    let mut node = self.node.lock().await;
+                    let node = self.node.lock().await;
                     let tcp_ok = node.try_auto_connect(sender_id).await;
                     println!("[DBG] try_auto_connect 完成, tcp_ok={}", tcp_ok);
-
-                    // TCP 直连失败 → 若对方附带了打洞映射, 自动启动 UDP 打洞
-                    // (先释放 node 锁再启动, 避免与打洞任务内部加锁死锁; 之后重新获取)
-                    if !tcp_ok {
-                        if let Some((peer_mapped, peer_sid)) =
-                            crate::holepunch::extract_holepunch_info(raw_message)
-                        {
-                            println!(
-                                "[DBG] TCP直连未建立, 自动启动UDP打洞: 对方映射={} 会话={}",
-                                peer_mapped, peer_sid
-                            );
-                            drop(node);
-                            let node_arc = Arc::clone(&self.node);
-                            tokio::spawn(async move {
-                                crate::holepunch::start_hole_punch(node_arc, sender_id, peer_mapped)
-                                    .await;
-                            });
-                            node = self.node.lock().await;
-                        }
-                    }
 
                     let info = node.get_ip_info().await;
                     return Some(format!("[CQ:at,qq={}]{}", sender_id, info));

@@ -1,14 +1,12 @@
 //! P2P 节点：节点信息交换、TCP 直连服务、连接管理
 //!
-//! 预留：NAT 打洞（STUN + UDP Hole Punching）将在后续版本加入本模块，
-//! 方案见项目根目录 `P2P_HOLE_PUNCHING.md`（M1 计划）。
+//! 2026-08-24 起：UDP 打洞（MVP）随可行性验证归档至 `legacy/holepunch-mvp/`，
+//! 正式传输层按 `docs/plan/P2P_INFRA_PLAN.md` 转向 libp2p（N1 里程碑）。
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
@@ -33,61 +31,18 @@ pub enum BotEvent {
     GroupMessage { user_id: u64, group_id: u64, message: String, #[allow(dead_code)] raw_message: String },
     Connected { user_id: u64 },
     Disconnected { user_id: u64 },
-    /// UDP 打洞结果：会话结束（成功/失败）时发出，由消息处理层回 QQ
-    HolePunchResult {
-        user_id: u64,
-        success: bool,
-        #[allow(dead_code)]
-        peer_mapped: Option<SocketAddr>,
-        detail: String,
-    },
-}
-
-/// 打洞会话状态
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionState {
-    /// 正在发包打洞
-    Punching,
-    /// 已连通
-    Connected,
-    /// 失败（超时 / STUN 错误）
-    Failed,
-}
-
-/// 一次 UDP 打洞会话
-#[derive(Debug, Clone)]
-pub struct HolePunchSession {
-    /// 本机会话 ID（探测包携带，ACK 据此对号入座）
-    pub session_id: u64,
-    /// 对端 QQ 号
-    pub peer_user_id: u64,
-    /// 本机 NAT 映射地址
-    pub my_mapped: SocketAddr,
-    /// 对方 NAT 映射地址
-    pub peer_mapped: SocketAddr,
-    pub state: SessionState,
 }
 
 /// P2P 节点：维护本机节点信息、对端 Peer 表与连接状态
 #[derive(Debug)]
 pub struct P2PNode {
-    /// 本机 QQ 号（预留：打洞会话校验对端身份时使用）
+    /// 本机 QQ 号（预留：身份校验）
     #[allow(dead_code)]
     pub user_id: u64,
     pub ip: String,
     pub port: u16,
     pub peers: Arc<Mutex<HashMap<u64, PeerInfo>>>,
     pub peer_ips: Arc<Mutex<HashMap<u64, String>>>,
-    /// UDP 打洞 socket（STUN 查询与打洞发包共用，保证映射一致性）
-    pub udp_sock: Option<Arc<UdpSocket>>,
-    /// UDP 打洞监听端口
-    pub udp_port: u16,
-    /// STUN 服务器地址
-    pub stun_server: Option<SocketAddr>,
-    /// 本机 NAT 映射地址缓存（STUN 查询结果，供节点信息附带打洞行）
-    pub my_mapped: Option<SocketAddr>,
-    /// 打洞会话表（key = 对端 QQ 号）
-    pub hole_sessions: Arc<Mutex<HashMap<u64, HolePunchSession>>>,
     event_tx: Arc<Mutex<broadcast::Sender<BotEvent>>>,
 }
 
@@ -95,11 +50,6 @@ impl P2PNode {
     pub async fn new(user_id: u64) -> Result<(Self, broadcast::Receiver<BotEvent>)> {
         let ip = Self::get_public_ip().await?;
         Ok(Self::new_with_ip(user_id, ip))
-    }
-
-    /// 构造节点但不查询公网 IP（供 `holepunch` 等仅需 UDP 打洞、不依赖外网 IP 的命令使用）
-    pub async fn new_offline(user_id: u64) -> Result<(Self, broadcast::Receiver<BotEvent>)> {
-        Ok(Self::new_with_ip(user_id, "0.0.0.0".to_string()))
     }
 
     fn new_with_ip(user_id: u64, ip: String) -> (Self, broadcast::Receiver<BotEvent>) {
@@ -111,11 +61,6 @@ impl P2PNode {
             port: 0,
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_ips: Arc::new(Mutex::new(HashMap::new())),
-            udp_sock: None,
-            udp_port: 0,
-            stun_server: None,
-            my_mapped: None,
-            hole_sessions: Arc::new(Mutex::new(HashMap::new())),
             event_tx: Arc::new(Mutex::new(event_tx)),
         }, event_rx)
     }
@@ -133,17 +78,7 @@ impl P2PNode {
     }
 
     pub async fn get_ip_info(&self) -> String {
-        // 打洞映射行：仅当 UDP 打洞已启用且 STUN 查询成功时附带（会话 ID 用于日志追踪）
-        match self.my_mapped {
-            Some(m) => format!(
-                "🌐 我的P2P节点信息:\n📍 公网IP: {}\n🔌 端口: {}\n📡 P2P打洞: udp://{} 会话={}",
-                self.ip,
-                self.port,
-                m,
-                rand::random::<u64>()
-            ),
-            None => format!("🌐 我的P2P节点信息:\n📍 公网IP: {}\n🔌 端口: {}", self.ip, self.port),
-        }
+        format!("🌐 我的P2P节点信息:\n📍 公网IP: {}\n🔌 端口: {}", self.ip, self.port)
     }
 
     pub async fn send_event(&self, event: BotEvent) {
@@ -203,60 +138,6 @@ impl P2PNode {
                 }
             }
         }
-    }
-
-    /// 启动 UDP 打洞服务：绑定 UDP socket、查询 STUN 缓存映射地址、监听打洞报文。
-    /// socket 全程共享，STUN 查询与打洞发包使用同一 socket（映射一致性）。
-    /// `keepalive_interval` 为后台保活周期(周期性向 STUN 发包维持 NAT 映射), 0 表示禁用保活。
-    pub async fn start_udp_server(
-        node: Arc<Mutex<P2PNode>>,
-        port: u16,
-        stun_server: SocketAddr,
-        keepalive_interval: Duration,
-    ) -> Result<()> {
-        let sock = Arc::new(
-            UdpSocket::bind(("0.0.0.0", port))
-                .await
-                .context("绑定UDP端口失败")?,
-        );
-        println!("[*] UDP打洞监听在 0.0.0.0:{} (STUN: {})", port, stun_server);
-
-        {
-            let mut n = node.lock().await;
-            n.udp_sock = Some(Arc::clone(&sock));
-            n.udp_port = port;
-            n.stun_server = Some(stun_server);
-        }
-
-        // 启动时查询一次 STUN(带重试), 缓存本机映射(供 get_ip_info 附带打洞行)
-        match crate::holepunch::query_mapped_addr_retry(&sock, stun_server).await {
-            Ok(m) => {
-                println!("[+] 本机STUN映射地址: {}", m);
-                let mut n = node.lock().await;
-                n.my_mapped = Some(m);
-            }
-            Err(e) => {
-                eprintln!("[!] STUN 查询失败(节点信息将不附带打洞行): {}", e);
-            }
-        }
-
-        // UDP 监听循环
-        let node2 = Arc::clone(&node);
-        tokio::spawn(async move {
-            if let Err(e) = crate::holepunch::run_udp_listener(node2).await {
-                eprintln!("[!] UDP监听循环退出: {}", e);
-            }
-        });
-
-        // 后台保活: 周期性向 STUN 发包, 维持 NAT 映射不超时(等待/信令交换期间地址长期有效)
-        if !keepalive_interval.is_zero() {
-            let node3 = Arc::clone(&node);
-            tokio::spawn(async move {
-                crate::holepunch::keepalive_loop(node3, keepalive_interval).await;
-            });
-        }
-
-        Ok(())
     }
 
     async fn handle_connection(ip: &str, mut stream: TcpStream) {
@@ -372,7 +253,7 @@ impl P2PNode {
         None
     }
 
-    /// 尝试自动连接对端（TCP）。返回是否连接成功，供调用方决定是否转 UDP 打洞。
+    /// 尝试自动连接对端（TCP）。返回是否连接成功。
     pub async fn try_auto_connect(&self, user_id: u64) -> bool {
         let peer_ips = self.peer_ips.lock().await;
         if let Some(peer_ip_port) = peer_ips.get(&user_id) {
@@ -520,11 +401,6 @@ mod tests {
             port: 9000,
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_ips: Arc::new(Mutex::new(HashMap::new())),
-            udp_sock: None,
-            udp_port: 0,
-            stun_server: None,
-            my_mapped: None,
-            hole_sessions: Arc::new(Mutex::new(HashMap::new())),
             event_tx: Arc::new(Mutex::new(event_tx)),
         };
         let msg = "🌐 我的P2P节点信息:\n📍 公网IP: 8.8.8.8\n🔌 端口: 8080";

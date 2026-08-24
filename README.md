@@ -2,6 +2,8 @@
 
 通过QQ机器人自动建立P2P连接，双方只需发送简单消息即可完成IP交换和连接。
 
+> **项目路线**：当前为"QQ 信令控制面 + TCP 直连"版本；正式目标为**虚拟网卡**（libp2p 传输 + 自研编排层 + wintun TUN），实施计划见 [`docs/plan/P2P_INFRA_PLAN.md`](docs/plan/P2P_INFRA_PLAN.md)。
+
 ## 自动化流程
 
 ```
@@ -110,52 +112,6 @@ cargo run -- friends
 cargo run -- groups
 ```
 
-### UDP 打洞联调（绕开 QQ 信令）
-
-两个进程/两台机器不经过 QQ，直接命令行互相打洞。**启动即保活 + 无限期等待 + 未连通自动重试**，不要求双方掐点同时操作：
-
-```bash
-# 进程A: 指定对方映射地址作为默认值, 启动后回车即可采用(也可输入新地址覆盖)
-cargo run -- holepunch --port 8080 --peer-uid 2 --peer-mapped "B的ip:port"
-
-# 进程B: 不传 --peer-mapped, 启动后从 stdin 输入对方映射地址(不输入则一直保活等待)
-cargo run -- holepunch --port 8081 --peer-uid 1
-```
-
-启动流程：
-
-1. 绑定 UDP 端口 → 查 STUN 打印本机映射地址 → **后台保活**（默认每 20 秒刷新映射，等待期间地址长期有效）
-2. 无限期等待输入对方映射地址：回车采用 `--peer-mapped` 默认值，或输入新地址覆盖；不输入则一直保活等（Ctrl+C 退出）
-3. 输入后开始**持续打洞**：每轮约 10 秒发包，未连通自动等 3 秒重试，直到连通或 Ctrl+C
-4. 探测包携带本机最新映射地址，对方收到后自动更新——映射端口变化也不影响继续打洞
-5. 连通后保持监听（等对方也完成确认），Ctrl+C 退出
-
-参数说明：
-
-| 参数 | 说明 |
-|------|------|
-| `--port` | UDP 打洞监听端口，两个进程必须不同 |
-| `--peer-uid` | 对端标识（本机会话表 key，可任意填，仅日志用） |
-| `--peer-mapped` | 对方 NAT 映射地址 `ip:port`；作为交互输入默认值，也可输入新地址覆盖 |
-| `--retry` | 打洞重试轮数上限，0=无限重试直到连通（默认 0） |
-| `--keepalive` | 保活间隔秒数，0=禁用保活（默认 20） |
-| `--stun` | STUN 服务器（默认 `stun.l.google.com:19302`） |
-
-上帝视角用法：两个终端各跑一条命令（不传 `--peer-mapped`），两边都打印出自己的映射地址后，把对方地址粘贴进另一个终端回车。谁先启动、谁先输入都无所谓——先输入的先打洞，后输入的后打洞，保活保证地址不丢，重试保证后启动的也能被覆盖到。
-
-### 查询本机 NAT 映射地址
-
-只查一次 STUN，打印本机公网 `ip:port` 后立即退出，不做任何打洞动作：
-
-```bash
-# 端口自动分配
-cargo run -- mapped
-# 输出: 54.251.93.8:54321
-
-# 固定本地端口查询（与 holepunch 配合时须用相同 --port，映射才一致）
-cargo run -- mapped --port 8080
-```
-
 ## 完整对话示例
 
 **A发送：**
@@ -204,18 +160,29 @@ cargo run -- mapped --port 8080
 ## 项目结构
 
 ```
-src/
-├── main.rs    # CLI 入口 + 任务装配
-├── app.rs     # BotApp 消息处理
-├── napcat.rs  # NapCat HTTP API 客户端
-├── p2p.rs     # P2P 节点（TCP 直连、节点信息交换）
-└── ws.rs      # WebSocket 事件监听与消息分发
+src/                    # 主工程源码
+├── main.rs             # CLI 入口 + 任务装配
+├── app.rs              # BotApp 消息处理
+├── napcat.rs           # NapCat HTTP API 客户端
+├── p2p.rs              # P2P 节点（TCP 直连、节点信息交换）
+└── ws.rs               # WebSocket 事件监听与消息分发
 
-scripts/       # 运行/维护脚本（start、run、check、stop 等）
-docs/          # 文档（PHONE_GUIDE 使用指南、P2P_HOLE_PUNCHING 打洞方案）
+docs/                   # 文档（按 research/plan/guides/legacy 分类，见 docs/00-INDEX.md）
+├── 00-INDEX.md         # 文档索引
+├── research/           # 调研结论
+├── plan/               # 方案与计划（当前实施依据）
+├── guides/             # 使用指南
+└── legacy/             # 已废弃路线存档
+
+legacy/holepunch-mvp/   # MVP（双方 UDP 打洞）独立工程，仅作联调工具
+scripts/                # 运行/维护脚本
 ```
 
-> P2P 打洞（NAT 穿越）方案详见 `docs/P2P_HOLE_PUNCHING.md`，M1 实现将新增 `src/holepunch.rs`。
+## 历史与路线
+
+- **MVP（UDP 打洞）**：可行性验证产物，2026-08-24 已归档至 `legacy/holepunch-mvp/`（含独立 Cargo 工程与说明）。
+- **当前**：QQ 信令控制面 + TCP 直连。
+- **正式目标**：按 [`docs/plan/P2P_INFRA_PLAN.md`](docs/plan/P2P_INFRA_PLAN.md) 推进——libp2p 传输层（N1）→ 自研编排层 + wintun TUN 虚拟网卡（N2）→ QQ 信令集成 + 一键安装（N3）。
 
 ## 注意事项
 

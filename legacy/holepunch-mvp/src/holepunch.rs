@@ -14,6 +14,11 @@
 //! 5. 收到 HOLEPUNCH 探测包即回 HOLEPUNCH-ACK，互收 ACK 判定连通
 //!
 //! 探测/确认报文为明文 UTF-8（M1 不加密、不重传、不传文件）。
+//!
+//! 归档说明：本文件保留主工程时期的完整 API（含 `extract_holepunch_info` /
+//! `start_hole_punch` 等信令侧函数），供后续 libp2p 集成时参考，故允许 dead_code。
+
+#![allow(dead_code)]
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
