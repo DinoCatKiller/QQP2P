@@ -2,7 +2,7 @@
 //!
 //! 模块划分：
 //! - `napcat`：NapCat HTTP API 客户端
-//! - `p2p`  ：P2P 节点（TCP 直连、节点信息交换）
+//! - `p2p`  ：P2P 节点（既有 TCP 传输，也有 libp2p 传输 POC）
 //! - `ws`   ：WebSocket 事件监听与消息分发
 //! - `app`  ：BotApp 消息处理
 
@@ -17,11 +17,16 @@ use clap::{Parser, Subcommand};
 
 use crate::app::BotApp;
 use crate::napcat::NapCatClient;
-use crate::p2p::P2PNode;
+use crate::p2p::{P2pService, start_transport};  // 新的 libp2p P2P Service
+use crate::legacy_p2p::P2PNode;      // 旧的 TCP P2PNode (兼容)
+
+// 兼容旧文件名（已重命名为 legacy_p2p.rs，保留向后兼忽）
+#[allow(dead_code)]
+mod legacy_p2p;
 
 #[derive(Parser, Debug)]
 #[command(name = "qqp2p")]
-#[command(about = "QQ P2P连接机器人 - 通过@消息自动建立P2P连接")]
+#[command(about = "QQ P2P连接机器人 - 通过@消息自自动建立P2P连接")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -29,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// 启动P2P机器人（监听QQ消息）
+    /// 启动QQ P2P 机器人（监听QQ消息）
     Start {
         #[arg(short, long, default_value = "12345")]
         user_id: u64,
@@ -41,7 +46,7 @@ enum Commands {
         #[arg(short, long, default_value = "12345")]
         user_id: u64,
     },
-    /// 连接到对端
+    /// 连接到对端 (使用传统 TCP 方式)
     Connect {
         #[arg(short, long)]
         target: String,
@@ -73,6 +78,16 @@ enum Commands {
     Groups,
     /// 检查登录状态
     Online,
+    /// 启动 libp2p 传输层 POC (N1 里程碑)
+    P2pStart {
+        #[arg(short, long, default_value = "30303")]
+        port: u16,
+    },
+    /// 通过 PeerId 连接 (N1 联调子命令)
+    P2pConnect {
+        #[arg(short, long)]
+        peer_id: String,
+    },
 }
 
 #[tokio::main]
@@ -101,9 +116,15 @@ async fn main() -> Result<()> {
             println!("[*]   • 双方自动建立P2P连接");
             println!();
 
+            // N1: 同时启动 libp2p 传输层 (后台)，TCP 服务器由 libp2p 处理
+            let _p2p_handle = tokio::spawn(async move {
+                let _ = start_transport(port).await;
+            });
+
             let app_clone = Arc::clone(&app.node);
             let tcp_handle = tokio::spawn(async move {
-                P2PNode::start_tcp_server(app_clone, port).await
+                // P2PNode::start_tcp_server(app_clone, port).await
+                println!("[*] TCP 服务器由 libp2p 传输层处理 (N1 阶段)");
             });
 
             let app_clone = app.clone();
@@ -220,6 +241,39 @@ async fn main() -> Result<()> {
                 Ok(false) => println!("[!] 机器人未在线，请检查 NapCat 是否启动"),
                 Err(e) => println!("[!] 检查失败: {}", e),
             }
+            Ok(())
+        }
+
+        // N1: 启动 libp2p 传输层 POC
+        Commands::P2pStart { port } => {
+            println!("[*] 启动 libp2p 传输层 POC (N1 里程碑)...");
+            println!("[*] 监听端口: {}", port);
+
+            // 初始化 libp2p 传输层
+            let (swarm, listen_multiaddr, peer_id) = start_transport(port).await?;
+
+            println!("[*] 本地 PeerId: {}", peer_id);
+            println!("[*] 监听地址: {}", listen_multiaddr);
+
+            // 创建 P2PService 实例
+            let local_virtual_ip = "10.0.0.1".to_string(); // 示例虚拟 IP
+            let p2p_service = P2pService::new(port, local_virtual_ip).await?;
+
+            println!("[*] P2PService 创建完成");
+
+            // 主循环：处理 swarm 事件
+            let mut service = p2p_service;
+            loop {
+                service.poll_events().await;
+            }
+        }
+
+        // N1: 通过 PeerId 连接 (手动联调)
+        Commands::P2pConnect { peer_id } => {
+            println!("[*] 通过 PeerId 连接: {}", peer_id);
+            // TODO: 实现通过 PeerId 连接的逻辑
+            // 这将需要解析对等节点的多地址并调用 P2pService::connect_to_peer
+            println!("[!] 此功能将在 N1.4 联调中实现");
             Ok(())
         }
     }
