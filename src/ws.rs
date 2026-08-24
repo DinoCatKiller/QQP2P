@@ -153,17 +153,6 @@ pub async fn run_message_handler(app: BotApp, mut event_rx: tokio::sync::broadca
             Ok(BotEvent::Disconnected { user_id }) => {
                 println!("[!] {} 已断开P2P连接", user_id);
             }
-            Ok(BotEvent::HolePunchResult { user_id, success, peer_mapped: _, detail }) => {
-                println!(
-                    "[{}] 打洞结果 user={}: {}",
-                    if success { "+" } else { "!" },
-                    user_id,
-                    detail
-                );
-                if let Err(e) = app.send_reply(user_id, &detail).await {
-                    eprintln!("[!] 发送打洞结果失败: {}", e);
-                }
-            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 println!("[*] 丢失 {} 个事件", n);
             }

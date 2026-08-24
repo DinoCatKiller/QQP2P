@@ -1,0 +1,11 @@
+[package]
+name = "holepunch-mvp"
+version = "0.1.0"
+edition = "2021"
+description = "MVP: UDP NAT 穿越打洞联调工具（可行性验证产物，已归档）"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rand = "0.8"
