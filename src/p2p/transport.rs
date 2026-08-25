@@ -25,15 +25,18 @@ pub use libp2p::Multiaddr;
 // -----------------------------------------------------------
 
 /// 组合行为事件枚举（手动定义，供 derive 宏 `to_swarm` 引用）
+///
+/// `Identify` 变体较大，使用 `Box` 装箱以减小 enum 整体体积，
+/// 避免触发 `clippy::large_enum_variant` 警告。
 #[derive(Debug)]
 pub enum TunBehaviourEvent {
-    Identify(identify::Event),
+    Identify(Box<identify::Event>),
     Tun(request_response::Event<HelloMsg, JoinAckMsg>),
 }
 
 impl From<identify::Event> for TunBehaviourEvent {
     fn from(e: identify::Event) -> Self {
-        TunBehaviourEvent::Identify(e)
+        TunBehaviourEvent::Identify(Box::new(e))
     }
 }
 
