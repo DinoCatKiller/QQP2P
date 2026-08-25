@@ -142,7 +142,10 @@ pub async fn query_mapped_addr_retry(sock: &UdpSocket, stun_server: SocketAddr) 
 /// 双方同时 UDP 打洞
 ///
 /// 双方同时向对方映射地址发探测包，互开 NAT 洞。
-/// 收到对方探测包即回 ACK，互收 ACK 判定连通。
+///
+/// 退出条件（任一满足即 Ok）：
+/// - 收到对方 ACK：对方收到我方探测包才回 ACK → 双向都通
+/// - 收到对方探测包：对方→我方 通，立即回 ACK 让对方也能判定
 ///
 /// 返回 Ok(()) 表示打洞成功。
 pub async fn hole_punch(
@@ -158,21 +161,18 @@ pub async fn hole_punch(
     let send_interval = tokio::time::interval(std::time::Duration::from_millis(200));
     tokio::pin!(send_interval);
 
+    // 收到对方探测包后切换为发 ACK 模式（让对方尽快判定连通）
     let mut got_probe = false;
-    let mut got_ack = false;
 
     println!("[*] 开始打洞 → {} (超时 {}s)", peer_mapped, timeout_secs);
 
     loop {
         tokio::select! {
             _ = &mut deadline => {
-                if got_ack {
-                    return Ok(());
-                }
                 anyhow::bail!("打洞超时 ({}s)", timeout_secs);
             }
             _ = send_interval.tick() => {
-                // 每次发探测包（带 ACK 如果已收到对方探测）
+                // 收到对方探测包后改发 ACK (否则继续发探测包开洞)
                 let msg = if got_probe {
                     format!("HOLEPUNCH-ACK {}", my_uid)
                 } else {
@@ -185,15 +185,16 @@ pub async fn hole_punch(
                 let line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
                 if line.starts_with("HOLEPUNCH-ACK") {
-                    println!("[+] 收到 ACK from {}", src);
-                    got_ack = true;
-                    if got_probe { return Ok(()); }
+                    // 对方收到我方探测包才回 ACK → 我方→对方 通 (对方发包到我也通了)
+                    println!("[+] 收到 ACK from {} → 双向连通, 打洞成功", src);
+                    return Ok(());
                 } else if line.starts_with("HOLEPUNCH") {
                     println!("[+] 收到探测包 from {}", src);
                     got_probe = true;
-                    // 立即回 ACK
+                    // 立即回 ACK 让对方也能判定连通
                     let ack = format!("HOLEPUNCH-ACK {}", my_uid);
                     let _ = sock.send_to(ack.as_bytes(), src).await;
+                    // 不立即 return: 等对方 ACK 确认双向连通 (但已发出 ACK, 对方收到就会退出)
                 }
             }
         }
