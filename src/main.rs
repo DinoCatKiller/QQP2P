@@ -296,16 +296,36 @@ async fn main() -> Result<()> {
             let local_virtual_ip = "10.0.0.1".to_string();
             let mut service = P2pService::new(port, local_virtual_ip).await?;
 
+            // 预热：poll 几次拿到所有 NewListenAddr 事件
+            for _ in 0..5 {
+                service.poll_events().await;
+            }
+
             println!();
             println!("[*] ── 本机信息 ──");
             println!("[*] PeerId: {}", service.peer_id());
-            println!("[*] 可拨号地址: {}", service.dialable_addr());
             println!("[*] 虚拟IP: {}", service.local_virtual_ip());
             println!();
+            println!("[*] 可拨号地址列表:");
+            let addrs = service.dialable_addrs();
+            if addrs.is_empty() {
+                println!("[*]   (暂无，等待监听事件...)");
+            } else {
+                for (i, addr) in addrs.iter().enumerate() {
+                    println!("[*]   [{}] {}", i, addr);
+                }
+            }
+            println!();
+            println!("[*] ── 跨网络说明 ──");
+            println!("[*]   • 同机联调：选 127.0.0.1 的地址");
+            println!("[*]   • 同局域网：选 192.168.x.x 的地址");
+            println!("[*]   • 跨网络：对方需用你的公网IP构造地址:");
+            println!("[*]     /ip4/<你的公网IP>/udp/{}/quic-v1/p2p/{}", port, service.peer_id());
+            println!();
             println!("[*] ── 操作说明 ──");
-            println!("[*] 1. 将上面的「可拨号地址」发送给对方");
+            println!("[*] 1. 从上方选一个合适的地址发给对方");
             println!("[*] 2. 输入对方给你的可拨号地址并回车");
-            println!("[*] 3. 或直接回车等待对方拨入");
+            println!("[*] 3. 或直接回车 → 监听模式，等待对方拨入");
             println!();
             print!("[*] 请输入对方地址: ");
 
@@ -316,7 +336,7 @@ async fn main() -> Result<()> {
                 println!("[*] 正在拨号: {}", input);
                 service.dial_addr(input);
             } else {
-                println!("[*] 等待对方拨入...");
+                println!("[*] 监听模式：等待对方拨入...");
             }
 
             println!();
