@@ -215,21 +215,30 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     let endpoint = create_endpoint(std_sock)?;
     println!("[+] QUIC Endpoint 已创建");
 
-    // 9. 双方同时 dial + accept
+    // 9. 双方同时 dial + accept, 用 spawn 让两条连接都保持存活
+    //    避免 select! 退出后未选中的 future 被 drop, 导致对端连接被关闭
     println!("[*] 正在建立 QUIC 连接（双方同时 dial + accept）...");
 
+    let (dial_tx, mut dial_rx) = tokio::sync::oneshot::channel::<quinn::Connection>();
+    let (accept_tx, mut accept_rx) = tokio::sync::oneshot::channel::<quinn::Connection>();
+
     let dial_endpoint = endpoint.clone();
-    let dial_fut = async {
+    tokio::spawn(async move {
         let conn = dial_endpoint
             .connect(peer_mapped, "p2p")
             .map_err(|e| anyhow::anyhow!("connect: {}", e))?
             .await
             .map_err(|e| anyhow::anyhow!("connection: {}", e))?;
-        Ok::<quinn::Connection, anyhow::Error>(conn)
-    };
+        // 如果主流程已选另一条连接, send 失败, 这里让 conn 在 task 中保持存活避免被 drop
+        let _ = dial_tx.send(conn.clone());
+        // 用 pending 让 task 永不退出, conn (clone) 不会被 drop
+        // 这样即使主流程选了另一条连接, 这条连接也保持 idle 存活, 不会 abort 对端
+        std::future::pending::<()>().await;
+        Ok::<_, anyhow::Error>(())
+    });
 
     let accept_endpoint = endpoint.clone();
-    let accept_fut = async {
+    tokio::spawn(async move {
         let incoming = accept_endpoint
             .accept()
             .await
@@ -237,17 +246,20 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
         let conn = incoming
             .await
             .map_err(|e| anyhow::anyhow!("accept: {}", e))?;
-        Ok::<quinn::Connection, anyhow::Error>(conn)
-    };
+        let _ = accept_tx.send(conn.clone());
+        std::future::pending::<()>().await;
+        Ok::<_, anyhow::Error>(())
+    });
 
+    // 取先完成的连接, 另一个 task 继续在后台保持连接存活
     let conn = tokio::select! {
-        res = dial_fut => {
+        conn = &mut dial_rx => {
             println!("[+] 通过 dial 建立连接");
-            res?
+            conn.map_err(|_| anyhow::anyhow!("dial sender dropped"))?
         }
-        res = accept_fut => {
+        conn = &mut accept_rx => {
             println!("[+] 通过 accept 收到连接");
-            res?
+            conn.map_err(|_| anyhow::anyhow!("accept sender dropped"))?
         }
     };
 
@@ -257,30 +269,36 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     println!();
 
     // 10. 在 QUIC 连接上交换 HELLO/JOIN_ACK
+    //    用 unidirectional streams 避免双向流角色冲突 (双方都 open_uni + accept_uni)
     println!("[*] ── 交换 HELLO/JOIN_ACK ──");
 
-    let (mut send, mut recv) = conn.open_bi().await?;
+    // 发送任务: open_uni 发起流, 写入 HELLO + JOIN_ACK
+    let send_conn = conn.clone();
+    let send_task = tokio::spawn(async move {
+        let mut send = send_conn.open_uni().await?;
+        let hello = b"HELLO peer_id=local virtual_ip=10.0.0.1 features=3";
+        send.write_all(hello).await?;
+        send.write_all(b"JOIN_ACK members=2 peer_id=local virtual_ip=10.0.0.1 peer_id=remote virtual_ip=10.0.0.1").await?;
+        let _ = send.finish();
+        Ok::<_, anyhow::Error>(send)
+    });
 
-    // 发送 HELLO
-    let hello = b"HELLO peer_id=local virtual_ip=10.0.0.1 features=3";
-    send.write_all(hello).await?;
-    println!("[+] 已发送 HELLO");
-
-    // 接收对方 HELLO
-    let mut buf = vec![0u8; 1024];
-    if let Some(n) = recv.read(&mut buf).await? {
+    // 接收任务: accept_uni 接收对方的流, 读 HELLO + JOIN_ACK
+    let recv_task = tokio::spawn(async move {
+        let mut recv = conn.accept_uni().await?;
+        let mut buf = vec![0u8; 1024];
+        // 读 HELLO
+        let n = recv.read(&mut buf).await?.unwrap_or(0);
         println!("[+] 收到: {}", String::from_utf8_lossy(&buf[..n]));
-    }
-
-    // 回复 JOIN_ACK
-    let ack = b"JOIN_ACK members=2 peer_id=local virtual_ip=10.0.0.1 peer_id=remote virtual_ip=10.0.0.1";
-    send.write_all(ack).await?;
-    println!("[+] 已回复 JOIN_ACK");
-
-    // 接收对方 JOIN_ACK
-    if let Some(n) = recv.read(&mut buf).await? {
+        // 读 JOIN_ACK
+        let n = recv.read(&mut buf).await?.unwrap_or(0);
         println!("[+] 收到: {}", String::from_utf8_lossy(&buf[..n]));
-    }
+        Ok::<_, anyhow::Error>(recv)
+    });
+
+    send_task.await??;
+    println!("[+] 已发送 HELLO + JOIN_ACK");
+    let _ = recv_task.await?;
 
     println!();
     println!("[*] ═══════════════════════════════════════════");
