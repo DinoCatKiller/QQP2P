@@ -11,11 +11,15 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
+use rand::RngCore;
 
-use crate::p2p::holepunch::{hole_punch, query_mapped_addr_retry, resolve_stun_server};
+use crate::p2p::holepunch::{
+    build_binding_request, hole_punch, query_mapped_addr_retry, resolve_stun_server,
+};
 
 /// 默认 STUN 服务器
 const DEFAULT_STUN: &str = "stun.l.google.com:19302";
@@ -135,43 +139,83 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     let stun_addr = resolve_stun_server(stun).await?;
     println!("[*] STUN 服务器: {}", stun_addr);
 
+    // 包成 Arc 便于 keep-alive 后台任务共享
+    let tokio_sock = Arc::new(tokio_sock);
+
     let my_mapped = query_mapped_addr_retry(&tokio_sock, stun_addr).await?;
     println!("[*] 本机映射地址: {}", my_mapped);
     println!("[*] 虚拟IP: 10.0.0.1");
     println!();
 
-    // 3. 等待用户输入对方地址
+    // 3. 启动 keep-alive 后台任务: 每 10s 发 STUN 包刷新 NAT 映射
+    //    避免用户输入慢导致 NAT 映射过期
+    println!("[*] [保活] 等待输入期间每 10s 发 STUN 包保持 NAT 映射");
+    let keep_sock = Arc::clone(&tokio_sock);
+    let keep_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await; // 跳过首次立即触发
+        loop {
+            interval.tick().await;
+            // 发 STUN 包保活 (同时也能检测 NAT 是否还活着)
+            let mut tx_id = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut tx_id);
+            let req = build_binding_request(tx_id);
+            if keep_sock.send_to(&req, stun_addr).await.is_err() {
+                continue;
+            }
+            // 收响应避免 socket buf 堆积, 500ms 超时即可
+            let mut buf = [0u8; 1500];
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                keep_sock.recv_from(&mut buf),
+            ).await;
+        }
+    });
+
+    // 4. 等待用户输入对方地址 (用 spawn_blocking 避免 tokio runtime 阻塞)
     println!("[*] ── 操作说明 ──");
     println!("[*] 1. 把上面的「映射地址」发给对方");
     println!("[*] 2. 输入对方给你的映射地址并回车");
     println!("[*] 3. 双方都输入后同时开始打洞");
     println!();
     print!("[*] 请输入对方映射地址 (ip:port): ");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
 
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    let input = tokio::task::spawn_blocking(|| {
+        let mut s = String::new();
+        let _ = std::io::stdin().read_line(&mut s);
+        s
+    }).await?;
+
+    // 5. 取消 keep-alive, 拆出 Arc 取回原始 socket 用于打洞
+    keep_handle.abort();
+    let _ = keep_handle.await; // 等 task 真正退出, Arc 才能被 try_unwrap
+    let tokio_sock = Arc::try_unwrap(tokio_sock)
+        .map_err(|_| anyhow::anyhow!("keep-alive task 未释放 socket, 内部错误"))?;
+
     let input = input.trim();
     if input.is_empty() {
         anyhow::bail!("未输入对方地址");
     }
     let peer_mapped: SocketAddr = input.parse()?;
 
-    // 4. 双方同时 UDP 打洞
+    // 6. 双方同时 UDP 打洞
     println!();
     println!("[*] ── 开始 UDP 打洞 ──");
     hole_punch(&tokio_sock, peer_mapped, 1, 30).await?;
     println!("[+] 打洞成功! NAT 洞已打开");
     println!();
 
-    // 5. 把 socket 转回 std，交给 quinn
+    // 7. 把 socket 转回 std，交给 quinn
     let std_sock = tokio_sock.into_std()?;
 
-    // 6. 创建 quinn Endpoint
+    // 8. 创建 quinn Endpoint
     println!("[*] 创建 QUIC Endpoint...");
     let endpoint = create_endpoint(std_sock)?;
     println!("[+] QUIC Endpoint 已创建");
 
-    // 7. 双方同时 dial + accept
+    // 9. 双方同时 dial + accept
     println!("[*] 正在建立 QUIC 连接（双方同时 dial + accept）...");
 
     let dial_endpoint = endpoint.clone();
@@ -212,7 +256,7 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     println!("[+] 加密: TLS 1.3 (QUIC 内置)");
     println!();
 
-    // 8. 在 QUIC 连接上交换 HELLO/JOIN_ACK
+    // 10. 在 QUIC 连接上交换 HELLO/JOIN_ACK
     println!("[*] ── 交换 HELLO/JOIN_ACK ──");
 
     let (mut send, mut recv) = conn.open_bi().await?;
