@@ -151,7 +151,6 @@ pub async fn hole_punch(
     my_uid: u64,
     timeout_secs: u64,
 ) -> Result<()> {
-    let probe = format!("HOLEPUNCH {}", my_uid);
     let mut buf = [0u8; 1500];
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
     tokio::pin!(deadline);

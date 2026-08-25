@@ -33,7 +33,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerification {
         &self,
         _: &rustls::pki_types::CertificateDer<'_>,
         _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::ServerName<'_>,
+        _: &rustls::pki_types::ServerName<'_>,
         _: &[u8],
         _: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
@@ -45,7 +45,6 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerification {
         _: &[u8],
         _: &rustls::pki_types::CertificateDer<'_>,
         _: &rustls::DigitallySignedStruct,
-        _: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
@@ -55,8 +54,6 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerification {
         _: &[u8],
         _: &rustls::pki_types::CertificateDer<'_>,
         _: &rustls::DigitallySignedStruct,
-        _: Option<&rustls::ServerName<'_>>,
-        _: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
@@ -78,24 +75,29 @@ fn create_endpoint(std_sock: std::net::UdpSocket) -> Result<Endpoint> {
     // 1. 生成自签名证书
     let cert = rcgen::generate_simple_self_signed(vec!["p2p".to_string()])?;
     let cert_der = cert.cert.der().clone();
-    let key_der = cert.key_pair.der().clone();
+    let key_der = cert.key_pair.serialize_der();
 
     // 2. Server config（自签名证书）
     let server_crypto = rustls::server::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)?;
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
+        .with_single_cert(
+            vec![cert_der],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
+        )?;
+    let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?;
+    let server_config = ServerConfig::with_crypto(Arc::new(quic_server));
 
     // 3. Client config（跳过证书验证，P2P 场景）
     let client_crypto = rustls::client::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerification))
         .with_no_client_auth();
-    let client_config = ClientConfig::new(Arc::new(client_crypto));
+    let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?;
+    let client_config = ClientConfig::new(Arc::new(quic_client));
 
     // 4. 创建 quinn Endpoint（复用已打洞的 socket）
     let runtime = Arc::new(quinn::TokioRuntime);
-    let endpoint = Endpoint::new(
+    let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
         Some(server_config),
         std_sock,
@@ -111,14 +113,6 @@ fn create_endpoint(std_sock: std::net::UdpSocket) -> Result<Endpoint> {
 // -----------------------------------------------------------
 
 /// 运行 P2P 节点（STUN + 打洞 + QUIC 握手 + 消息交换）
-///
-/// 流程：
-/// 1. 绑定 UDP socket → STUN 查映射 → 打印映射地址
-/// 2. 等待用户输入对方映射地址
-/// 3. 双方同时 UDP 打洞（互开 NAT 洞）
-/// 4. 在打洞后的 socket 上创建 quinn Endpoint
-/// 5. 双方同时 dial + accept → QUIC 握手
-/// 6. 在 QUIC 连接上交换 HELLO/JOIN_ACK
 pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     let stun = stun_server.unwrap_or(DEFAULT_STUN);
 
@@ -167,7 +161,7 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     println!();
 
     // 5. 把 socket 转回 std，交给 quinn
-    let std_sock = tokio_sock.into_std();
+    let std_sock = tokio_sock.into_std()?;
 
     // 6. 创建 quinn Endpoint
     println!("[*] 创建 QUIC Endpoint...");
@@ -179,9 +173,12 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
 
     let dial_endpoint = endpoint.clone();
     let dial_fut = async {
-        dial_endpoint
-            .connect(peer_mapped, "p2p")?
+        let conn = dial_endpoint
+            .connect(peer_mapped, "p2p")
+            .map_err(|e| anyhow::anyhow!("connect: {}", e))?
             .await
+            .map_err(|e| anyhow::anyhow!("connection: {}", e))?;
+        Ok::<quinn::Connection, anyhow::Error>(conn)
     };
 
     let accept_endpoint = endpoint.clone();
@@ -190,19 +187,22 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
             .accept()
             .await
             .ok_or_else(|| anyhow::anyhow!("endpoint closed"))?;
-        incoming.await
+        let conn = incoming
+            .await
+            .map_err(|e| anyhow::anyhow!("accept: {}", e))?;
+        Ok::<quinn::Connection, anyhow::Error>(conn)
     };
 
     let conn = tokio::select! {
         res = dial_fut => {
             println!("[+] 通过 dial 建立连接");
-            res
+            res?
         }
         res = accept_fut => {
             println!("[+] 通过 accept 收到连接");
-            res
+            res?
         }
-    }?;
+    };
 
     println!("[+] QUIC 连接已建立!");
     println!("[+] 对端地址: {}", conn.remote_address());
@@ -212,7 +212,6 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     // 8. 在 QUIC 连接上交换 HELLO/JOIN_ACK
     println!("[*] ── 交换 HELLO/JOIN_ACK ──");
 
-    // 打开双向流
     let (mut send, mut recv) = conn.open_bi().await?;
 
     // 发送 HELLO
@@ -222,10 +221,8 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
 
     // 接收对方 HELLO
     let mut buf = vec![0u8; 1024];
-    let n = recv.read(&mut buf).await?.unwrap_or(0);
-    if n > 0 {
-        let msg = String::from_utf8_lossy(&buf[..n]);
-        println!("[+] 收到: {}", msg);
+    if let Some(n) = recv.read(&mut buf).await? {
+        println!("[+] 收到: {}", String::from_utf8_lossy(&buf[..n]));
     }
 
     // 回复 JOIN_ACK
@@ -234,19 +231,16 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     println!("[+] 已回复 JOIN_ACK");
 
     // 接收对方 JOIN_ACK
-    let n = recv.read(&mut buf).await?.unwrap_or(0);
-    if n > 0 {
-        let msg = String::from_utf8_lossy(&buf[..n]);
-        println!("[+] 收到: {}", msg);
+    if let Some(n) = recv.read(&mut buf).await? {
+        println!("[+] 收到: {}", String::from_utf8_lossy(&buf[..n]));
     }
 
     println!();
     println!("[*] ═══════════════════════════════════════════");
-    println!("[*]  N1 验收：QUIC 连接 + 消息互通 + 加密 ✅");
+    println!("[*]  N1 验收：QUIC 连接 + 消息互通 + 加密");
     println!("[*] ═══════════════════════════════════════════");
     println!("[*] 按 Ctrl+C 退出");
 
-    // 保持连接
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }

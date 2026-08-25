@@ -20,7 +20,7 @@ pub const TUN_PROTOCOL: StreamProtocol = StreamProtocol::new("/tun/1.0.0");
 
 /// 协议消息类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum MessageType {
     HELLO = 0x01,
     JOIN_ACK = 0x02,

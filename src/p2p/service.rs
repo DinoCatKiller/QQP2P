@@ -158,7 +158,7 @@ impl P2pService {
         match event {
             TunBehaviourEvent::Identify(identify_event) => {
                 use libp2p::identify::Event as IdentifyEvent;
-                match identify_event {
+                match *identify_event {
                     IdentifyEvent::Received { peer_id, info, .. } => {
                         println!(
                             "[*] Identify 收到对端信息: {} (agent={:?}, protocols={:?})",
