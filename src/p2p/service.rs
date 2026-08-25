@@ -93,6 +93,17 @@ impl P2pService {
         }
     }
 
+    /// 返回所有可拨号地址（监听地址 + /p2p/<peerid> 后缀）
+    ///
+    /// 包括回环、局域网、虚拟网卡等所有 swarm 报告的监听地址。
+    pub fn dialable_addrs(&self) -> Vec<String> {
+        let peer_id = self.peer_id();
+        self.swarm
+            .listeners()
+            .map(|addr| format!("{}/p2p/{}", addr, peer_id))
+            .collect()
+    }
+
     /// 返回本机可拨号地址（回环，用于同机双进程联调）
     pub fn dialable_addr(&self) -> String {
         format!("/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}", self.listen_port, self.peer_id())
