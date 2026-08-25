@@ -126,6 +126,9 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     let std_sock = std::net::UdpSocket::bind(format!("0.0.0.0:{}", port))?;
     println!("[*] UDP socket 绑定: 0.0.0.0:{}", port);
 
+    // 必须设为非阻塞，否则 tokio::net::UdpSocket::from_std 在 Linux/Android 上会 panic
+    std_sock.set_nonblocking(true)?;
+
     let tokio_sock = tokio::net::UdpSocket::from_std(std_sock)?;
 
     // 2. STUN 查映射
