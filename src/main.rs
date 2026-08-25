@@ -95,6 +95,14 @@ enum Commands {
         #[arg(short, long, default_value = "30303")]
         port: u16,
     },
+    /// P2P 节点：STUN + UDP 打洞 + QUIC 握手（双方同时打洞，兼容更多 NAT）
+    P2pNode {
+        #[arg(short, long, default_value = "30303")]
+        port: u16,
+        /// STUN 服务器（默认 stun.l.google.com:19302）
+        #[arg(short, long)]
+        stun: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -347,6 +355,11 @@ async fn main() -> Result<()> {
             loop {
                 service.poll_events().await;
             }
+        }
+
+        // N1: P2P 节点 (STUN + UDP 打洞 + QUIC 握手)
+        Commands::P2pNode { port, stun } => {
+            crate::p2p::run_p2p_node(port, stun.as_deref()).await
         }
     }
 }
