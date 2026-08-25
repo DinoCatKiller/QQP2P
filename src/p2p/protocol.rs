@@ -8,7 +8,11 @@
 #![allow(dead_code)]
 
 use libp2p::PeerId;
+use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
+
+/// /tun/1.0.0 协议标识（用于 request-response 协商）
+pub const TUN_PROTOCOL: StreamProtocol = StreamProtocol::new("/tun/1.0.0");
 
 // ============================================================
 // 消息类型

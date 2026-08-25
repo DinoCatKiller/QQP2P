@@ -82,11 +82,18 @@ enum Commands {
     P2pStart {
         #[arg(short, long, default_value = "30303")]
         port: u16,
+        #[arg(short, long)]
+        connect: Option<String>,
     },
     /// 通过 PeerId 连接 (N1 联调子命令)
     P2pConnect {
         #[arg(short, long)]
         peer_id: String,
+    },
+    /// 测试专用：手动交换地址建立连接 (不改原有命令逻辑)
+    P2pTest {
+        #[arg(short, long, default_value = "30303")]
+        port: u16,
     },
 }
 
@@ -245,24 +252,25 @@ async fn main() -> Result<()> {
         }
 
         // N1: 启动 libp2p 传输层 POC
-        Commands::P2pStart { port } => {
+        Commands::P2pStart { port, connect } => {
             println!("[*] 启动 libp2p 传输层 POC (N1 里程碑)...");
             println!("[*] 监听端口: {}", port);
 
-            // 初始化 libp2p 传输层
-            let (_swarm, listen_multiaddr, peer_id) = start_transport(port).await?;
-
-            println!("[*] 本地 PeerId: {}", peer_id);
-            println!("[*] 监听地址: {}", listen_multiaddr);
-
-            // 创建 P2PService 实例
+            // 创建 P2P 服务（内部启动 QUIC 传输层 + identify）
             let local_virtual_ip = "10.0.0.1".to_string(); // 示例虚拟 IP
-            let p2p_service = P2pService::new(port, local_virtual_ip).await?;
+            let mut service = P2pService::new(port, local_virtual_ip).await?;
 
-            println!("[*] P2PService 创建完成");
+            println!("[*] 本地 PeerId: {}", service.peer_id());
+            println!("[*] 可拨号地址 (回环联调): {}", service.dialable_addr());
+
+            // 可选：主动拨号对端
+            if let Some(target) = connect {
+                service.dial_addr(&target);
+            }
+
+            println!("[*] 等待连接 (Ctrl+C 退出)...");
 
             // 主循环：处理 swarm 事件
-            let mut service = p2p_service;
             loop {
                 service.poll_events().await;
             }
@@ -275,6 +283,50 @@ async fn main() -> Result<()> {
             // 这将需要解析对等节点的多地址并调用 P2pService::connect_to_peer
             println!("[!] 此功能将在 N1.4 联调中实现");
             Ok(())
+        }
+
+        // N1: 测试专用 - 手动交换地址建立连接
+        Commands::P2pTest { port } => {
+            println!("[*] ═══════════════════════════════════════════");
+            println!("[*]  P2P 测试模式 (手动交换地址)");
+            println!("[*] ═══════════════════════════════════════════");
+            println!("[*] 监听端口: {}", port);
+            println!();
+
+            let local_virtual_ip = "10.0.0.1".to_string();
+            let mut service = P2pService::new(port, local_virtual_ip).await?;
+
+            println!();
+            println!("[*] ── 本机信息 ──");
+            println!("[*] PeerId: {}", service.peer_id());
+            println!("[*] 可拨号地址: {}", service.dialable_addr());
+            println!("[*] 虚拟IP: {}", service.local_virtual_ip());
+            println!();
+            println!("[*] ── 操作说明 ──");
+            println!("[*] 1. 将上面的「可拨号地址」发送给对方");
+            println!("[*] 2. 输入对方给你的可拨号地址并回车");
+            println!("[*] 3. 或直接回车等待对方拨入");
+            println!();
+            print!("[*] 请输入对方地址: ");
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+            if !input.is_empty() {
+                println!("[*] 正在拨号: {}", input);
+                service.dial_addr(input);
+            } else {
+                println!("[*] 等待对方拨入...");
+            }
+
+            println!();
+            println!("[*] 连接建立后将自动交换 HELLO/JOIN_ACK");
+            println!("[*] 按 Ctrl+C 退出");
+            println!();
+
+            loop {
+                service.poll_events().await;
+            }
         }
     }
 }

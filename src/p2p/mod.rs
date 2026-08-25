@@ -1,7 +1,7 @@
 //! P2P 节点：基于 libp2p 传输层 + 自研 /tun/1.0.0 协议
 //!
 //! N1 里程碑：传输层 POC
-//! - libp2p 传输层（QUIC/TCP + noise + yamux）
+//! - libp2p 传输层（QUIC/UDP）
 //! - DCUtR 打洞
 //! - /tun/1.0.0 自定义协议（TUN 包 + 控制消息复用）
 //! - 兼容旧版 TCP P2PNode（通过 legacy_p2p 模块重导出）

@@ -3,12 +3,12 @@
 //! 负责：Endpoint 启动、监听、PeerId 打印
 //! 遵循文档：/tun/1.0.0 协议家族
 //!
-//! N1 阶段：TCP + Noise + Yamux
+//! N1 阶段：QUIC (UDP) 传输，DCUtR 打洞主方案
 
-use std::time::Duration;
-
-use libp2p::identity;
 use libp2p::swarm::Swarm;
+use libp2p::{identify, request_response, SwarmBuilder};
+
+use crate::p2p::protocol::{HelloMsg, JoinAckMsg, TUN_PROTOCOL};
 
 // -----------------------------------------------------------
 // 核心类型重导出
@@ -21,6 +21,39 @@ pub use libp2p::PeerId;
 pub use libp2p::Multiaddr;
 
 // -----------------------------------------------------------
+// 组合网络行为
+// -----------------------------------------------------------
+
+/// 组合行为事件枚举（手动定义，供 derive 宏 `to_swarm` 引用）
+#[derive(Debug)]
+pub enum TunBehaviourEvent {
+    Identify(identify::Event),
+    Tun(request_response::Event<HelloMsg, JoinAckMsg>),
+}
+
+impl From<identify::Event> for TunBehaviourEvent {
+    fn from(e: identify::Event) -> Self {
+        TunBehaviourEvent::Identify(e)
+    }
+}
+
+impl From<request_response::Event<HelloMsg, JoinAckMsg>> for TunBehaviourEvent {
+    fn from(e: request_response::Event<HelloMsg, JoinAckMsg>) -> Self {
+        TunBehaviourEvent::Tun(e)
+    }
+}
+
+/// 组合行为：identify + /tun/1.0.0 request-response
+#[derive(libp2p::swarm::NetworkBehaviour)]
+#[behaviour(to_swarm = "TunBehaviourEvent")]
+pub struct TunBehaviour {
+    /// identify 协议：连接自检、交换 PeerId/地址信息
+    pub identify: identify::Behaviour,
+    /// /tun/1.0.0 请求-响应：HELLO → JOIN_ACK 交换
+    pub tun: request_response::json::Behaviour<HelloMsg, JoinAckMsg>,
+}
+
+// -----------------------------------------------------------
 // 传输层启动函数
 // -----------------------------------------------------------
 
@@ -30,35 +63,38 @@ pub use libp2p::Multiaddr;
 /// * `listen_port` - 监听端口号
 ///
 /// # 返回
-/// * `(Swarm, Multiaddr, PeerId)` - Swarm 实例、监听多地址、本地 PeerId
+/// * `(Swarm<TunBehaviour>, Multiaddr, PeerId)` - Swarm 实例、监听多地址、本地 PeerId
 pub async fn start_transport(
     listen_port: u16,
-) -> anyhow::Result<(Swarm<libp2p::identify::Identify>, Multiaddr, PeerId)> {
-    // 1. 生成本地密钥对和 PeerId
-    let local_keypair = identity::Keypair::generate_ed25519();
-    let peer_id = PeerId::from(local_keypair.public());
+) -> anyhow::Result<(Swarm<TunBehaviour>, Multiaddr, PeerId)> {
+    // 1. 通过 SwarmBuilder 生成身份（Ed25519 密钥对）并装配 QUIC + 组合行为
+    let mut swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|key| {
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/tun/1.0.0".to_string(),
+                key.public(),
+            ));
+            let tun = request_response::json::Behaviour::new(
+                [(TUN_PROTOCOL, request_response::ProtocolSupport::Full)],
+                request_response::Config::default(),
+            );
+            TunBehaviour { identify, tun }
+        })?
+        .build();
 
+    let peer_id = *swarm.local_peer_id();
     println!("[*] 本地 PeerId: {}", peer_id);
 
-    // 2. 使用 development_transport 构建传输层 (TCP + Noise + Yamux)
-    let transport = libp2p::development_transport(local_keypair.clone()).await?;
+    // 2. 监听 QUIC (UDP) 端口，协议后缀为 quic-v1
+    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", listen_port).parse()?;
 
-    // 3. Identify 协议 - 使用默认配置
-    let behaviour = libp2p::identify::Identify::new(
-        libp2p::identify::IdentifyConfig::new("/tun/1.0.0".into(), local_keypair.public())
-            .with_interval(Duration::from_secs(15)),
-    );
+    swarm
+        .listen_on(listen_addr.clone())
+        .map_err(|e| anyhow::anyhow!("监听 QUIC 地址失败: {e}"))?;
 
-    // 4. 创建 Swarm
-    let mut swarm = Swarm::new(transport, behaviour, peer_id);
-
-    // 5. 监听端口
-    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", listen_port).parse()?;
-
-    swarm.listen_on(listen_addr.clone())
-        .map_err(|e| anyhow::anyhow!("监听地址失败: {}", e))?;
-
-    println!("[*] 正在监听: {}", listen_addr);
+    println!("[*] 正在监听 QUIC: {}", listen_addr);
 
     Ok((swarm, listen_addr, peer_id))
 }

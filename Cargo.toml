@@ -15,5 +15,6 @@ url = "2"
 tokio-tungstenite = "0.21"
 
 [dependencies.libp2p]
-version = "0.42"
-default-features = true
+version = "0.56"
+default-features = false
+features = ["quic", "identify", "tokio", "request-response", "json", "macros"]
