@@ -1,11 +1,10 @@
-//! QUIC 节点：STUN + UDP 打洞 + QUIC 握手
+//! Noise 节点：STUN + UDP 打洞 + Noise 握手
 //!
 //! 绕开 libp2p 的 QUIC 封装，直接管理 UDP socket：
 //! 1. 绑定 UDP socket → STUN 查映射
 //! 2. 双方同时 UDP 打洞（互开 NAT 洞）
-//! 3. 在打洞后的 socket 上创建 quinn Endpoint
-//! 4. 双方同时 dial + accept → QUIC 握手（TLS 1.3 加密）
-//! 5. 在 QUIC 连接上交换 HELLO/JOIN_ACK
+//! 3. 在打洞后的 socket 上做 Noise_XX 握手（ChaCha20-Poly1305 加密）
+//! 4. 在加密通道上交换 HELLO/JOIN_ACK
 
 #![allow(dead_code)]
 
@@ -13,9 +12,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
-use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
+use anyhow::{Context, Result};
 use rand::RngCore;
+use snow::Builder as NoiseBuilder;
+use tokio::net::UdpSocket;
 
 use crate::p2p::holepunch::{
     build_binding_request, hole_punch, query_mapped_addr_retry, resolve_stun_server,
@@ -24,104 +24,22 @@ use crate::p2p::holepunch::{
 /// 默认 STUN 服务器
 const DEFAULT_STUN: &str = "stun.l.google.com:19302";
 
-// -----------------------------------------------------------
-// TLS 自签名证书 + 跳过验证
-// -----------------------------------------------------------
+/// Noise 协议参数：XX 模式 + Curve25519 + ChaChaPoly + BLAKE2s
+const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
-/// 跳过服务器证书验证（P2P 自签名证书场景）
-#[derive(Debug)]
-struct SkipVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipVerification {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-        ]
-    }
-}
-
-/// 生成自签名证书 + 创建 quinn Endpoint
-fn create_endpoint(std_sock: std::net::UdpSocket) -> Result<Endpoint> {
-    // 1. 生成自签名证书
-    let cert = rcgen::generate_simple_self_signed(vec!["p2p".to_string()])?;
-    let cert_der = cert.cert.der().clone();
-    let key_der = cert.key_pair.serialize_der();
-
-    // 2. Server config（自签名证书）
-    let server_crypto = rustls::server::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert_der],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
-        )?;
-    let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?;
-    let server_config = ServerConfig::with_crypto(Arc::new(quic_server));
-
-    // 3. Client config（跳过证书验证，P2P 场景）
-    let client_crypto = rustls::client::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerification))
-        .with_no_client_auth();
-    let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?;
-    let client_config = ClientConfig::new(Arc::new(quic_client));
-
-    // 4. 创建 quinn Endpoint（复用已打洞的 socket）
-    let runtime = Arc::new(quinn::TokioRuntime);
-    let mut endpoint = Endpoint::new(
-        EndpointConfig::default(),
-        Some(server_config),
-        std_sock,
-        runtime,
-    )?;
-    endpoint.set_default_client_config(client_config);
-
-    Ok(endpoint)
-}
+/// Noise 握手单步超时
+const NOISE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 // -----------------------------------------------------------
 // P2P 节点主逻辑
 // -----------------------------------------------------------
 
-/// 运行 P2P 节点（STUN + 打洞 + QUIC 握手 + 消息交换）
+/// 运行 P2P 节点（STUN + 打洞 + Noise 握手 + 消息交换）
 pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     let stun = stun_server.unwrap_or(DEFAULT_STUN);
 
     println!("[*] ═══════════════════════════════════════════");
-    println!("[*]  P2P 节点 (STUN + UDP打洞 + QUIC)");
+    println!("[*]  P2P 节点 (STUN + UDP打洞 + Noise)");
     println!("[*] ═══════════════════════════════════════════");
     println!("[*] 监听端口: {}", port);
     println!();
@@ -168,7 +86,8 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
             let _ = tokio::time::timeout(
                 Duration::from_millis(500),
                 keep_sock.recv_from(&mut buf),
-            ).await;
+            )
+            .await;
         }
     });
 
@@ -186,7 +105,8 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
         let mut s = String::new();
         let _ = std::io::stdin().read_line(&mut s);
         s
-    }).await?;
+    })
+    .await?;
 
     // 5. 取消 keep-alive, 拆出 Arc 取回原始 socket 用于打洞
     keep_handle.abort();
@@ -207,106 +127,162 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     println!("[+] 打洞成功! NAT 洞已打开");
     println!();
 
-    // 7. 把 socket 转回 std，交给 quinn
-    let std_sock = tokio_sock.into_std()?;
-
-    // 8. 创建 quinn Endpoint
-    println!("[*] 创建 QUIC Endpoint...");
-    let endpoint = create_endpoint(std_sock)?;
-    println!("[+] QUIC Endpoint 已创建");
-
-    // 9. 双方同时 dial + accept, 用 spawn 让两条连接都保持存活
-    //    避免 select! 退出后未选中的 future 被 drop, 导致对端连接被关闭
-    println!("[*] 正在建立 QUIC 连接（双方同时 dial + accept）...");
-
-    let (dial_tx, mut dial_rx) = tokio::sync::oneshot::channel::<quinn::Connection>();
-    let (accept_tx, mut accept_rx) = tokio::sync::oneshot::channel::<quinn::Connection>();
-
-    let dial_endpoint = endpoint.clone();
-    tokio::spawn(async move {
-        let conn = dial_endpoint
-            .connect(peer_mapped, "p2p")
-            .map_err(|e| anyhow::anyhow!("connect: {}", e))?
-            .await
-            .map_err(|e| anyhow::anyhow!("connection: {}", e))?;
-        // 如果主流程已选另一条连接, send 失败, 这里让 conn 在 task 中保持存活避免被 drop
-        let _ = dial_tx.send(conn.clone());
-        // 用 pending 让 task 永不退出, conn (clone) 不会被 drop
-        // 这样即使主流程选了另一条连接, 这条连接也保持 idle 存活, 不会 abort 对端
-        std::future::pending::<()>().await;
-        Ok::<_, anyhow::Error>(())
-    });
-
-    let accept_endpoint = endpoint.clone();
-    tokio::spawn(async move {
-        let incoming = accept_endpoint
-            .accept()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("endpoint closed"))?;
-        let conn = incoming
-            .await
-            .map_err(|e| anyhow::anyhow!("accept: {}", e))?;
-        let _ = accept_tx.send(conn.clone());
-        std::future::pending::<()>().await;
-        Ok::<_, anyhow::Error>(())
-    });
-
-    // 取先完成的连接, 另一个 task 继续在后台保持连接存活
-    let conn = tokio::select! {
-        conn = &mut dial_rx => {
-            println!("[+] 通过 dial 建立连接");
-            conn.map_err(|_| anyhow::anyhow!("dial sender dropped"))?
-        }
-        conn = &mut accept_rx => {
-            println!("[+] 通过 accept 收到连接");
-            conn.map_err(|_| anyhow::anyhow!("accept sender dropped"))?
-        }
-    };
-
-    println!("[+] QUIC 连接已建立!");
-    println!("[+] 对端地址: {}", conn.remote_address());
-    println!("[+] 加密: TLS 1.3 (QUIC 内置)");
+    // 7. 清空打洞阶段残留的 UDP 包（避免干扰 Noise 握手）
+    println!("[*] 清空打洞残留包...");
+    let mut drain_buf = [0u8; 1500];
+    while let Ok(Ok(_)) =
+        tokio::time::timeout(Duration::from_millis(200), tokio_sock.recv_from(&mut drain_buf)).await
+    {
+        // 持续清理打洞残留包
+    }
+    println!("[+] 残留包已清空");
     println!();
 
-    // 10. 在 QUIC 连接上交换 HELLO/JOIN_ACK
-    //    用 unidirectional streams 避免双向流角色冲突 (双方都 open_uni + accept_uni)
+    // 8. Noise_XX 握手
+    println!("[*] ── Noise 握手 ──");
+
+    // 生成静态密钥对（X25519）
+    let builder = NoiseBuilder::new(NOISE_PATTERN.parse()?);
+    let keypair = builder.generate_keypair()?;
+    println!("[*] 本地公钥: {}", hex_encode(&keypair.public));
+
+    // 确定角色：映射地址较小的一方为 Initiator（避免双方同时发送导致冲突）
+    // 极端情况下地址相同（不可能），双方都是 Responder 会导致死锁
+    let is_initiator = my_mapped < peer_mapped;
+    println!(
+        "[*] 角色: {}",
+        if is_initiator { "Initiator" } else { "Responder" }
+    );
+
+    let mut transport =
+        run_noise_handshake(&tokio_sock, peer_mapped, is_initiator, &keypair.private).await?;
+
+    println!("[+] Noise 握手完成!");
+    println!("[+] 加密: Noise Protocol (XX 模式, ChaCha20-Poly1305, Curve25519)");
+    println!();
+
+    // 9. 在加密通道上交换 HELLO/JOIN_ACK
     println!("[*] ── 交换 HELLO/JOIN_ACK ──");
 
-    // 发送任务: open_uni 发起流, 写入 HELLO + JOIN_ACK
-    let send_conn = conn.clone();
-    let send_task = tokio::spawn(async move {
-        let mut send = send_conn.open_uni().await?;
-        let hello = b"HELLO peer_id=local virtual_ip=10.0.0.1 features=3";
-        send.write_all(hello).await?;
-        send.write_all(b"JOIN_ACK members=2 peer_id=local virtual_ip=10.0.0.1 peer_id=remote virtual_ip=10.0.0.1").await?;
-        let _ = send.finish();
-        Ok::<_, anyhow::Error>(send)
-    });
+    // 发送 HELLO + JOIN_ACK（用换行分隔，一次加密发送）
+    let payload = "HELLO peer_id=local virtual_ip=10.0.0.1 features=3\n\
+                   JOIN_ACK members=2 peer_id=local virtual_ip=10.0.0.1 peer_id=remote virtual_ip=10.0.0.1";
+    let mut send_buf = vec![0u8; 1024];
+    let send_len = transport.write_message(payload.as_bytes(), &mut send_buf)?;
+    tokio_sock.send_to(&send_buf[..send_len], peer_mapped).await?;
+    println!("[+] 已发送 HELLO + JOIN_ACK (加密)");
 
-    // 接收任务: accept_uni 接收对方的流, 读 HELLO + JOIN_ACK
-    let recv_task = tokio::spawn(async move {
-        let mut recv = conn.accept_uni().await?;
-        let mut buf = vec![0u8; 1024];
-        // 读 HELLO
-        let n = recv.read(&mut buf).await?.unwrap_or(0);
-        println!("[+] 收到: {}", String::from_utf8_lossy(&buf[..n]));
-        // 读 JOIN_ACK
-        let n = recv.read(&mut buf).await?.unwrap_or(0);
-        println!("[+] 收到: {}", String::from_utf8_lossy(&buf[..n]));
-        Ok::<_, anyhow::Error>(recv)
-    });
+    // 接收对方的 HELLO + JOIN_ACK
+    let mut recv_buf = vec![0u8; 1500];
+    let (n, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_sock.recv_from(&mut recv_buf),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("等待对方消息超时"))?
+    .context("recv_from 失败")?;
 
-    send_task.await??;
-    println!("[+] 已发送 HELLO + JOIN_ACK");
-    let _ = recv_task.await?;
+    let mut pt = vec![0u8; 1500];
+    let pt_len = transport.read_message(&recv_buf[..n], &mut pt)?;
+    let received = String::from_utf8_lossy(&pt[..pt_len]);
+    for line in received.lines() {
+        println!("[+] 收到: {}", line);
+    }
 
     println!();
     println!("[*] ═══════════════════════════════════════════");
-    println!("[*]  N1 验收：QUIC 连接 + 消息互通 + 加密");
+    println!("[*]  N1 验收：Noise 连接 + 消息互通 + 加密");
     println!("[*] ═══════════════════════════════════════════");
     println!("[*] 按 Ctrl+C 退出");
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
+}
+
+// -----------------------------------------------------------
+// Noise_XX 握手
+// -----------------------------------------------------------
+
+/// 执行 Noise_XX 握手，返回传输模式状态
+///
+/// 双方根据映射地址大小确定角色：
+/// - Initiator（地址较小）: send → recv → send
+/// - Responder（地址较大）: recv → send → recv
+///
+/// 握手完成后进入传输模式，可加密/解密消息
+async fn run_noise_handshake(
+    sock: &UdpSocket,
+    peer: SocketAddr,
+    is_initiator: bool,
+    private_key: &[u8],
+) -> Result<snow::TransportState> {
+    let builder = NoiseBuilder::new(NOISE_PATTERN.parse()?).local_private_key(private_key)?;
+
+    let mut hs = if is_initiator {
+        builder.build_initiator()?
+    } else {
+        builder.build_responder()?
+    };
+
+    let mut buf = vec![0u8; 1024];
+    let mut recv_buf = vec![0u8; 1024];
+    let mut payload = vec![0u8; 1024];
+
+    if is_initiator {
+        // Initiator: send → recv → send
+        // msg 1: -> e
+        let len = hs.write_message(&[], &mut buf)?;
+        sock.send_to(&buf[..len], peer).await?;
+        println!("[*] [noise] 已发送 e ({} 字节)", len);
+
+        // msg 2: <- e, ee, s, es
+        let (n, _) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, sock.recv_from(&mut recv_buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("Noise 握手超时: 等待 msg 2"))?
+            .context("recv_from 失败")?;
+        hs.read_message(&recv_buf[..n], &mut payload)?;
+        if let Some(remote) = hs.get_remote_static() {
+            println!("[*] [noise] 对端公钥: {}", hex_encode(remote));
+        }
+
+        // msg 3: -> s, se
+        let len = hs.write_message(&[], &mut buf)?;
+        sock.send_to(&buf[..len], peer).await?;
+        println!("[*] [noise] 已发送 s ({} 字节)", len);
+    } else {
+        // Responder: recv → send → recv
+        // msg 1: <- e
+        let (n, _) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, sock.recv_from(&mut recv_buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("Noise 握手超时: 等待 msg 1"))?
+            .context("recv_from 失败")?;
+        hs.read_message(&recv_buf[..n], &mut payload)?;
+
+        // msg 2: -> e, ee, s, es
+        let len = hs.write_message(&[], &mut buf)?;
+        sock.send_to(&buf[..len], peer).await?;
+        println!("[*] [noise] 已发送 e + s ({} 字节)", len);
+
+        // msg 3: <- s, se
+        let (n, _) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, sock.recv_from(&mut recv_buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("Noise 握手超时: 等待 msg 3"))?
+            .context("recv_from 失败")?;
+        hs.read_message(&recv_buf[..n], &mut payload)?;
+        if let Some(remote) = hs.get_remote_static() {
+            println!("[*] [noise] 对端公钥: {}", hex_encode(remote));
+        }
+    }
+
+    Ok(hs.into_transport_mode()?)
+}
+
+// -----------------------------------------------------------
+// 辅助函数
+// -----------------------------------------------------------
+
+/// 十六进制编码（用于打印公钥）
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

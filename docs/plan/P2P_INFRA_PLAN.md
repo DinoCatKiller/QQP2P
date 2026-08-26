@@ -34,7 +34,7 @@ flowchart TB
     subgraph 节点A[节点A - qqp2p.exe]
         T1[wintun TUN 网卡<br/>虚拟IP 10.0.0.1]
         O1[编排层 自研<br/>IP分配/成员表/路由表<br/>包封装/ARP模拟]
-        L1[libp2p 传输层<br/>QUIC/TCP + noise + yamux]
+        L1[传输层<br/>自研 UDP 隧道 + Noise + STUN 打洞]
         T1 <--> O1 <--> L1
     end
 
@@ -59,7 +59,7 @@ flowchart TB
 
 | 层 | 组件 | 职责 | 来源 |
 |---|---|---|---|
-| 传输层 | libp2p（QUIC/TCP + noise + yamux） | 加密通道、多路复用、连接管理 | 开源 |
+| 传输层 | 自研 UDP 隧道（snow Noise_XX + STUN 打洞） | 加密通道、NAT 穿透、连接管理 | 自研 + 开源 |
 | 打洞 | DCUtR | 尽力直连，失败留待中继兜底 | 开源 |
 | 数据面 | `/tun/1.0.0` 自定义协议 | TUN 包封装 + 控制面消息 | 自研（协议） |
 | 编排层 | 自研模块 | IP 分配、成员表、路由表、包映射、ARP/广播模拟 | **自研（护城河）** |
@@ -73,6 +73,7 @@ flowchart TB
 | 项 | 选型 | 版本策略 |
 |---|---|---|
 | libp2p | `rust-libp2p`（crate `libp2p`） | **锁定版本**，启用 feature：`quic`、`tcp`、`noise`、`yamux`、`dcutr`、`relay`、`identify`、`ping`、`tokio` |
+| Noise 加密 | crate `snow` | `Noise_XX_25519_ChaChaPoly_BLAKE2s`，自研 UDP 隧道端到端加密 |
 | 异步运行时 | `tokio` | 与现有工程一致 |
 | TUN | `wintun` crate | 锁版本；Windows 平台 |
 | 日志 | `tracing` / `log` | 沿用现有 |
