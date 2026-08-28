@@ -95,7 +95,7 @@ enum Commands {
         #[arg(short, long, default_value = "30303")]
         port: u16,
     },
-    /// P2P 节点：STUN + UDP 打洞 + QUIC 握手（双方同时打洞，兼容更多 NAT）
+    /// P2P 节点：STUN + UDP 打洞 + Noise 握手（双方同时打洞，兼容更多 NAT）
     P2pNode {
         #[arg(short, long, default_value = "30303")]
         port: u16,
