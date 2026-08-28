@@ -30,6 +30,10 @@ const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// Noise 握手单步超时
 const NOISE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// UDP 收发缓冲区大小：用足 UDP 理论上限，避免 Windows WSAEMSGSIZE (os error 10040)
+/// —— 应用提供的 recv 缓冲区小于传入数据报时，Windows 会直接丢弃并返回 10040
+const UDP_RECV_BUF: usize = 65535;
+
 // -----------------------------------------------------------
 // P2P 节点主逻辑
 // -----------------------------------------------------------
@@ -82,7 +86,7 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
                 continue;
             }
             // 收响应避免 socket buf 堆积, 500ms 超时即可
-            let mut buf = [0u8; 1500];
+            let mut buf = [0u8; UDP_RECV_BUF];
             let _ = tokio::time::timeout(
                 Duration::from_millis(500),
                 keep_sock.recv_from(&mut buf),
@@ -128,12 +132,17 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     println!();
 
     // 7. 清空打洞阶段残留的 UDP 包（避免干扰 Noise 握手）
+    //    注意：Windows 上若残留包 > recv buf，recv_from 返回 Err(WSAEMSGSIZE) 且 OS 已丢弃该包。
+    //    旧逻辑 `while let Ok(Ok(_))` 遇到这种 Err 会立即退出循环，残留包没真正清干净。
+    //    正确做法：无论 Ok/Err 都继续，只在超时（无包可读）时退出。
     println!("[*] 清空打洞残留包...");
-    let mut drain_buf = [0u8; 1500];
-    while let Ok(Ok(_)) =
-        tokio::time::timeout(Duration::from_millis(200), tokio_sock.recv_from(&mut drain_buf)).await
-    {
-        // 持续清理打洞残留包
+    let mut drain_buf = [0u8; UDP_RECV_BUF];
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), tokio_sock.recv_from(&mut drain_buf)).await {
+            Ok(Ok(_)) => continue,   // 已消费一个残留包
+            Ok(Err(_)) => continue,  // 如 WSAEMSGSIZE: 包已被 OS 丢弃，继续清下一个
+            Err(_) => break,         // 超时 → 队列已清空
+        }
     }
     println!("[+] 残留包已清空");
     println!();
@@ -167,13 +176,13 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     // 发送 HELLO + JOIN_ACK（用换行分隔，一次加密发送）
     let payload = "HELLO peer_id=local virtual_ip=10.0.0.1 features=3\n\
                    JOIN_ACK members=2 peer_id=local virtual_ip=10.0.0.1 peer_id=remote virtual_ip=10.0.0.1";
-    let mut send_buf = vec![0u8; 1024];
+    let mut send_buf = vec![0u8; UDP_RECV_BUF];
     let send_len = transport.write_message(payload.as_bytes(), &mut send_buf)?;
     tokio_sock.send_to(&send_buf[..send_len], peer_mapped).await?;
     println!("[+] 已发送 HELLO + JOIN_ACK (加密)");
 
     // 接收对方的 HELLO + JOIN_ACK
-    let mut recv_buf = vec![0u8; 1500];
+    let mut recv_buf = vec![0u8; UDP_RECV_BUF];
     let (n, _) = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_sock.recv_from(&mut recv_buf),
@@ -182,7 +191,7 @@ pub async fn run_p2p_node(port: u16, stun_server: Option<&str>) -> Result<()> {
     .map_err(|_| anyhow::anyhow!("等待对方消息超时"))?
     .context("recv_from 失败")?;
 
-    let mut pt = vec![0u8; 1500];
+    let mut pt = vec![0u8; UDP_RECV_BUF];
     let pt_len = transport.read_message(&recv_buf[..n], &mut pt)?;
     let received = String::from_utf8_lossy(&pt[..pt_len]);
     for line in received.lines() {
@@ -225,9 +234,9 @@ async fn run_noise_handshake(
         builder.build_responder()?
     };
 
-    let mut buf = vec![0u8; 1024];
-    let mut recv_buf = vec![0u8; 1024];
-    let mut payload = vec![0u8; 1024];
+    let mut buf = vec![0u8; UDP_RECV_BUF];
+    let mut recv_buf = vec![0u8; UDP_RECV_BUF];
+    let mut payload = vec![0u8; UDP_RECV_BUF];
 
     if is_initiator {
         // Initiator: send → recv → send
