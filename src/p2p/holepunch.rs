@@ -161,9 +161,6 @@ pub async fn hole_punch(
     let send_interval = tokio::time::interval(std::time::Duration::from_millis(200));
     tokio::pin!(send_interval);
 
-    // 收到对方探测包后切换为发 ACK 模式（让对方尽快判定连通）
-    let mut got_probe = false;
-
     println!("[*] 开始打洞 → {} (超时 {}s)", peer_mapped, timeout_secs);
 
     loop {
@@ -172,12 +169,8 @@ pub async fn hole_punch(
                 anyhow::bail!("打洞超时 ({}s)", timeout_secs);
             }
             _ = send_interval.tick() => {
-                // 收到对方探测包后改发 ACK (否则继续发探测包开洞)
-                let msg = if got_probe {
-                    format!("HOLEPUNCH-ACK {}", my_uid)
-                } else {
-                    format!("HOLEPUNCH {}", my_uid)
-                };
+                // 持续发探测包开洞 (收到对方任何包即退出, 不再需要 ACK 模式切换)
+                let msg = format!("HOLEPUNCH {}", my_uid);
                 let _ = sock.send_to(msg.as_bytes(), peer_mapped).await;
             }
             res = sock.recv_from(&mut buf) => {
@@ -189,12 +182,13 @@ pub async fn hole_punch(
                     println!("[+] 收到 ACK from {} → 双向连通, 打洞成功", src);
                     return Ok(());
                 } else if line.starts_with("HOLEPUNCH") {
-                    println!("[+] 收到探测包 from {}", src);
-                    got_probe = true;
-                    // 立即回 ACK 让对方也能判定连通
+                    // 收到对方探测包 = 对方→我方通; UDP NAT 洞双向, 即证明双向连通
+                    // (旧逻辑"等 ACK 再退"会死锁: 对方收到我方 ACK 退出后不再发 ACK,
+                    //  我方永远等不到 → 超时。故收到任何打洞包即退出, 并回 ACK 帮对方退出)
+                    println!("[+] 收到探测包 from {} → 双向连通, 打洞成功", src);
                     let ack = format!("HOLEPUNCH-ACK {}", my_uid);
                     let _ = sock.send_to(ack.as_bytes(), src).await;
-                    // 不立即 return: 等对方 ACK 确认双向连通 (但已发出 ACK, 对方收到就会退出)
+                    return Ok(());
                 }
             }
         }
