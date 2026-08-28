@@ -75,9 +75,17 @@ if ($branch -eq 'main') {
 }
 
 # 提交并推送到远程
+# 用临时文件传 commit 消息, 避免 PowerShell 把多行字符串拆成多个参数 (pathspec 错误)
 git add -A
-git commit -m $m
-CheckLast
+$commitMsgFile = [System.IO.Path]::GetTempFileName()
+[System.IO.File]::WriteAllText($commitMsgFile, $m, [System.Text.UTF8Encoding]::new($false))
+git commit -F $commitMsgFile
+$commitExit = $LASTEXITCODE
+Remove-Item $commitMsgFile -Force -ErrorAction SilentlyContinue
+if ($commitExit -ne 0) {
+    Write-Host "git commit 失败, 已中止。你的代码改动都还在本地, 不会丢。" -ForegroundColor Red
+    exit 1
+}
 git push -u origin $branch
 CheckLast
 
