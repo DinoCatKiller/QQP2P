@@ -137,6 +137,7 @@ p2p-join <peer_id> <virtual_ip> <endpoint_hint...>
 - [ ] N1.1 工程骨架：加 `libp2p` 依赖，新建 `src/p2p/` 模块（`mod.rs`、`transport.rs`、`protocol.rs`、`service.rs`）
 - [ ] N1.2 `Endpoint` 启动：监听 + 打印 `PeerId`，`identify`/`ping` 自检
 - [ ] N1.3 自定义协议：注册 `/tun/1.0.0`，实现 `HELLO` / `JOIN_ACK` 交换
+
 - [ ] N1.4 手动联调：命令行子命令 `p2p connect <peer_id>` 打通一条测试消息
 - [ ] N1.5 **实测（硬门槛）**：宽带 ↔ 手机热点场景跑 DCUtR 直连，记录穿透率；不达标则评估自研 UDP 隧道方案（见风险表）
 - [ ] N1.6 写实测结论到本文件"实测记录"节
