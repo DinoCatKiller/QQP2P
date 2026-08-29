@@ -473,7 +473,7 @@ pub async fn run_p2p_bench(
     println!("[*] 开始 {} 轮测试", rounds);
     println!();
 
-    // 4. 循环测试
+    // 4. 循环测试 (复用主 socket, NAT 映射稳定, 更接近真实 P2P 节点行为)
     let mut results: Vec<BenchRound> = Vec::with_capacity(rounds as usize);
     println!("轮次 | 结果 | 耗时  | 失败阶段");
     println!("-----|------|-------|----------------");
@@ -481,7 +481,7 @@ pub async fn run_p2p_bench(
     for round in 1..=rounds {
         let t0 = std::time::Instant::now();
         let result = run_one_bench_round(
-            port, my_mapped, peer_mapped, stun_addr, hole_timeout_secs,
+            &tokio_sock, my_mapped, peer_mapped, hole_timeout_secs,
         )
         .await;
         let elapsed = t0.elapsed();
@@ -564,29 +564,15 @@ pub async fn run_p2p_bench(
 
 /// 跑一轮完整测试: 打洞 → drain → Noise 握手 → HELLO 交换
 ///
-/// 注意: 每轮用新 socket, 因为旧 socket 的 NAT 映射可能已过期/被回收,
-///       新 socket 会触发 NAT 重新分配端口 (更真实的模拟)
+/// 复用主 socket (NAT 映射稳定, 更接近真实 P2P 节点行为)
 async fn run_one_bench_round(
-    port: u16,
-    _my_mapped: SocketAddr,
+    sock: &UdpSocket,
+    my_mapped: SocketAddr,
     peer_mapped: SocketAddr,
-    stun_addr: SocketAddr,
     hole_timeout: u64,
 ) -> std::result::Result<(), (&'static str, anyhow::Error)> {
-    // 新 socket (模拟真实场景: 每次连接都是新的)
-    let std_sock = std::net::UdpSocket::bind(format!("0.0.0.0:{}", port))
-        .map_err(|e| ("打洞", anyhow::anyhow!("bind 失败: {}", e)))?;
-    std_sock.set_nonblocking(true)
-        .map_err(|e| ("打洞", anyhow::anyhow!("set_nonblocking 失败: {}", e)))?;
-    let sock = tokio::net::UdpSocket::from_std(std_sock)
-        .map_err(|e| ("打洞", anyhow::anyhow!("from_std 失败: {}", e)))?;
-
-    // 重新查本机映射 (NAT 可能给了新端口)
-    let my_mapped = query_mapped_addr_retry(&sock, stun_addr).await
-        .map_err(|e| ("打洞", anyhow::anyhow!("STUN 查询失败: {}", e)))?;
-
     // === 阶段1: 打洞 ===
-    hole_punch(&sock, peer_mapped, 1, hole_timeout).await
+    hole_punch(sock, peer_mapped, 1, hole_timeout).await
         .map_err(|e| ("打洞", e))?;
 
     // === drain 残留包 ===
@@ -604,7 +590,7 @@ async fn run_one_bench_round(
     let keypair = builder.generate_keypair()
         .map_err(|e| ("Noise握手", anyhow::anyhow!("生成密钥失败: {}", e)))?;
     let is_initiator = my_mapped < peer_mapped;
-    let mut transport = run_noise_handshake(&sock, peer_mapped, is_initiator, &keypair.private).await
+    let mut transport = run_noise_handshake(sock, peer_mapped, is_initiator, &keypair.private).await
         .map_err(|e| ("Noise握手", e))?;
 
     // === 阶段3: 消息交换 (HELLO + JOIN_ACK) ===
