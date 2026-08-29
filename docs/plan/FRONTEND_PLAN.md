@@ -1,263 +1,201 @@
 # QQP2P 前端工具页面实施计划（FRONTEND_PLAN）
 
-> 文档时间：2026-08-29
+> 文档时间：2026-08-29（v4：重排为 F0-F4 里程碑结构，对齐 P2P_INFRA_PLAN 的 N 系列风格）
 > 关联文档：[P2P_INFRA_PLAN.md](P2P_INFRA_PLAN.md)（N0-N5 后端里程碑）、[P2P_HOLE_PUNCHING.md](../legacy/P2P_HOLE_PUNCHING.md)（MVP 打洞）
-> 定位：在 N1（传输层 POC）已完成的基础上，新增一个 TS 前端工具页面，覆盖「登录 NapCat → 监听 QQ → P2P 请求确认 → 建立连接」完整用户流程，支持 Windows + Android。
-> 现状参考：后端核心已用 Rust 实现，见 [napcat.rs](../../src/napcat.rs)、[ws.rs](../../src/ws.rs)、[app.rs](../../src/app.rs)、[p2p/](../../src/p2p/)、MVP 打洞 [holepunch.rs](../../legacy/holepunch-mvp/src/holepunch.rs)。
+> 现状参考：NapCat 接口已在 [napcat.rs](../../src/napcat.rs) / [ws.rs](../../src/ws.rs) 跑通；P2P 打洞后端（[p2p/](../../src/p2p/)）尚不完全，本期不接。
+> 决策影响：作为前端实施图纸，里程碑任务照此执行。
 
 ---
 
-## 一、背景与目标
+## 一、决策结论
 
-### 1.1 现状
-- 后端核心已用 Rust 实现，当前入口是 CLI（`main.rs` 的 `start` / `p2p-node` 等子命令），**无 GUI**。
-  - [napcat.rs](../../src/napcat.rs)：NapCat HTTP API 客户端（登录信息 / 好友 / 群 / 发消息）
-  - [ws.rs](../../src/ws.rs)：WebSocket 监听 NapCat 事件 + 消息过滤（@机器人 / P2P 协议消息）
-  - [app.rs](../../src/app.rs)：BotApp 消息处理（流程1「给我一个p2p」回节点信息；流程2 收节点信息 → 自动连接 + 回发）
-  - [p2p/](../../src/p2p/)：N1 libp2p 传输层 POC（service / transport / protocol / quic_node / holepunch）
-  - [holepunch-mvp](../../legacy/holepunch-mvp/)：已验证的 UDP 打洞联调工具
-- N1 已完成：libp2p/QUIC 传输、`/tun/1.0.0` 协议、手动联调、Noise 加密、打洞实测（`P2pBench`）。
+多轮讨论后，方向已定死：
 
-### 1.2 目标
-做一个 TS 前端工具页面，把 CLI 流程可视化，满足用户 5 条需求：
-
-1. 前端输入 NapCat / QQ 信息 → 登录验证
-2. 一键启动「P2P 监听」（连 NapCat WS + 起 P2P 节点）
-3. 有人请求 P2P 时弹窗提醒，用户同意后输入验证信息建立连接
-4. 支持 Windows + Android
-5. 复用 MVP 验证过的「机器人通信交换打洞信息」流程
-
----
-
-## 二、需求拆解
-
-| # | 需求 | 对应后端能力 | 前端形态 |
-|---|---|---|---|
-| 1 | 输入 NapCat/QQ 信息登录 | [napcat.rs](../../src/napcat.rs) `get_login_info` / `check_online` | 登录配置页 |
-| 2 | 启动 P2P 监听 | [ws.rs](../../src/ws.rs) `websocket_listener` + [p2p](../../src/p2p/) `start_transport` | 主控台「启动监听」按钮 |
-| 3 | P2P 请求弹窗 + 确认 + 验证信息 | [app.rs](../../src/app.rs) 流程1/2 改为「推事件待确认」 | 弹窗 + 表单 |
-| 4 | Windows + Android | Tauri 2.0 跨平台 | 同一套代码 |
-| 5 | 复用 MVP 信令交换 | [app.rs](../../src/app.rs) 节点信息协议 + [holepunch.rs](../../legacy/holepunch-mvp/src/holepunch.rs) 打洞 | 后端复用，前端可视化 |
-
----
-
-## 三、技术选型
-
-### 3.1 推荐方案：Tauri 2.0 + TS 前端 + Rust 后端复用
-
-| 项 | 选型 | 理由 |
+| 决策项 | 结论 | 理由 |
 |---|---|---|
-| 应用框架 | **Tauri 2.0** | 前端 TS + 后端 Rust；同一套代码支持 Windows 与 Android；后端可直接复用现有 `src/` 模块 |
-| 前端语言 | TypeScript | 用户明确要求 |
-| 前端框架 | **Svelte 5**（推荐）/ Vue 3 / React | Svelte 轻量、Tauri 社区常用、上手快；最终由用户确认 |
-| 后端 | 现有 Rust 工程 + Tauri commands | napcat.rs / ws.rs / p2p / holepunch 几乎可直接调用 |
-| 状态推送 | Tauri Event（后端 → 前端） | P2P 请求 / 打洞进度从 Rust 推到前端弹窗 |
-| 持久化 | Tauri Store / JSON | 保存 NapCat 配置 |
+| 本期范围 | **只做前端与 NapCat 交互** | P2P 打洞后端未完全，先打通「登录→监听→弹窗→同意回发信令」 |
+| 「触发打洞」 | 延后 **F2**（后端就绪后） | 实际建连需 Rust holepunch/QUIC；本期「同意」= 通过 NapCat 回发信令（QQ 消息层，MVP 验证过） |
+| UI 框架 | **SolidJS**（solid-js） | 细粒度响应式 Signal、无虚拟 DOM diff、产物小、JSX 语法 |
+| 桌面容器 | **Tauri 2**（@tauri-apps/api） | 桌面 + 安卓；为后续 P2P 打洞（UDP 需原生层）留路径；本期 Rust 后端零逻辑 |
+| 路由/数据 | **TanStack 全家桶**（solid-router / solid-query；store/virtual 按需） | 100% 类型安全路由 + HTTP 缓存；已核实 Solid 适配均存在 |
+| 本地持久化 | **@tauri-apps/plugin-store**（JSON KV） | 不用 `@tanstack/solid-db`：它是嵌入式 DB+live query，通常配 sync 后端，对本地 P2P 工具 overkill |
+| 样式 | **Tailwind CSS v4** | Oxide 新引擎、CSS-based 配置 |
+| 构建 | **Vite** + `vite-plugin-solid` | Solid 官方推荐；基于 `create-tauri-app` Solid 模板改 |
+| 现有 Rust 后端 | 本期**不动**，仅作接口契约参考 | 前端 TS 等价实现 napcat.rs / ws.rs 逻辑，直连 NapCat |
 
-### 3.2 备选方案对比
-
-| 方案 | 优点 | 缺点 |
-|---|---|---|
-| **Tauri 2.0**（推荐） | 复用 Rust 后端；Android 原生支持；UDP 打洞可在 Rust 后端跑 | Android 仍在成熟中，需 NDK 环境 |
-| Web 前端 + Rust HTTP/WS 服务 | 实现简单，浏览器即开即用 | 安卓需 Termux 跑服务，体验差；浏览器不能直接 UDP 打洞 |
-| Electron + Rust sidecar | 生态成熟 | **不支持 Android**；体积大 |
-
-### 3.3 关键决策点（需用户确认）
-
-- **D1 前端框架**：Svelte 5 / Vue 3 / React（推荐 Svelte 5）
-- **D2 后端集成方式**：
-  - D2-a **集成**（推荐）：把现有 `src/` 作为 Tauri 后端 crate，暴露 commands。耦合低、调试方便
-  - D2-b **sidecar**：把 `qqp2p.exe` 作为子进程，前端通过 stdio/WS 通信。改动小，但进程间通信复杂
-- **D3 Android 是否本期交付**：Tauri Android 还在演进，建议先 Windows 跑通（F1），Android 作为里程碑 F2
+> 关键分工：**HTTP API → solid-query**（缓存/重试）；**WS 消息流 → Solid Signal/createStore**（持续推送，不用 Query）；**配置 → plugin-store**。
 
 ---
 
-## 四、整体架构
+## 二、架构蓝图
 
 ```mermaid
 flowchart TB
-    subgraph 前端[前端 - TypeScript/Svelte]
+    subgraph 前端[前端 - SolidJS / TypeScript]
         UI[页面: 登录/主控台/弹窗]
-        Store[状态: napcat/p2p/通知队列]
-        UI <--> Store
+        Signals[Signals: napcat 配置/消息流/通知队列]
+        NapcatClient[napcat-client.ts<br/>HTTP 调用封装]
+        WsClient[ws-client.ts<br/>WS 监听 + 消息过滤]
+        UI <--> Signals
+        UI --> NapcatClient
+        UI --> WsClient
+        NapcatClient --> Signals
+        WsClient --> Signals
     end
-    subgraph IPC[Tauri IPC]
-        Cmd[commands: 前端→后端]
-        Evt[events: 后端→前端]
-    end
-    subgraph 后端[后端 - Rust 复用现有模块]
-        NapcatClient[napcat.rs<br/>HTTP API 客户端]
-        WsListener[ws.rs<br/>WS 监听 + 消息过滤]
-        AppHandler[app.rs<br/>消息处理 改人工确认]
-        P2PNode[p2p/<br/>STUN + 打洞 + Noise]
+    subgraph Tauri壳[Tauri 2 壳]
+        HttpPlugin[plugin-http<br/>绕 CORS]
+        StorePlugin[plugin-store<br/>配置持久化]
     end
     subgraph 外部[外部]
         NapCat[(NapCat<br/>HTTP:3000 WS:3001)]
         QQ[(QQ 消息)]
-        Peer[对端 P2P 节点]
     end
 
-    UI -->|invoke| Cmd
-    Evt -->|listen| Store
-    Cmd --> NapcatClient
-    Cmd --> WsListener
-    Cmd --> P2PNode
-    WsListener --> AppHandler
-    AppHandler -->|broadcast 事件| Evt
-    P2PNode -->|打洞进度/结果| Evt
-    NapcatClient <--> NapCat
-    WsListener <--> NapCat
+    NapcatClient -->|通过| HttpPlugin
+    HttpPlugin -->|HTTP| NapCat
+    WsClient -->|WebSocket 直连| NapCat
+    UI -->|读写配置| StorePlugin
     NapCat <--> QQ
-    P2PNode <-->|UDP 打洞| Peer
 ```
 
 ### 分层职责
 
 | 层 | 职责 |
 |---|---|
-| 前端层（TS） | UI 渲染、用户交互、状态管理、事件监听 |
-| IPC 层（Tauri） | commands（前端→后端调用）、events（后端→前端推送） |
-| 后端层（Rust） | NapCat 通信、WS 监听、消息处理、P2P 打洞、Noise 加密 |
-| 外部 | NapCat（HTTP+WS）、QQ、对端节点 |
+| 前端层（SolidJS/TS） | UI、状态、NapCat HTTP/WS 调用、消息展示、P2P 请求弹窗 + 同意回发信令 |
+| Tauri 壳 | plugin-http 绕 CORS、plugin-store 持久化；F2 加 Rust 后端命令 |
+| 外部 | NapCat（HTTP+WS）、QQ |
 
 ---
 
-## 五、与现有 Rust 后端的复用关系
-
-| 现有模块 | 复用方式 | 需要的改造 |
-|---|---|---|
-| [napcat.rs](../../src/napcat.rs) | 直接作为 NapCat 客户端 | 暴露 `login` / `send_msg` 为 Tauri command |
-| [ws.rs](../../src/ws.rs) | `websocket_listener` 改为后台任务 | 事件由 broadcast 推到前端（替代 `println`） |
-| [app.rs](../../src/app.rs) `handle_message` | 流程2「自动连接」改为「推事件待确认」 | 拆分为「解析节点信息 → 推 `p2p:request` 事件 → 等前端确认 → 执行连接」 |
-| [p2p/holepunch.rs](../../src/p2p/holepunch.rs) | 打洞逻辑复用 | 暴露 `start_hole_punch` 为 command，进度推事件 |
-| [p2p/quic_node.rs](../../src/p2p/quic_node.rs) | Noise 握手 + 打洞 | 安卓 `set_nonblocking` 已适配 |
-| [main.rs](../../src/main.rs) `start` 命令 | 拆解为多个 command | 去掉 CLI 装配，改为前端触发 |
-
----
-
-## 六、前端模块划分
-
-```
-src/
-├── routes/             # 页面
-│   ├── login/          # 登录配置页
-│   ├── dashboard/      # 主控台（启动/停止监听、会话列表）
-│   └── components/     # P2P 请求弹窗、通知/日志区
-├── stores/             # 状态
-│   ├── napcat.svelte.ts     # NapCat 配置 + 登录态
-│   ├── p2p.svelte.ts       # 监听态 + 会话表
-│   └── notifications.svelte.ts  # 弹窗队列
-└── lib/
-    ├── api.ts          # invoke 封装（前端→后端）
-    └── events.ts      # listen 封装（后端→前端）
-```
-
----
-
-## 七、核心数据流：P2P 请求 → 弹窗 → 确认 → 连接
+## 三、核心数据流：NapCat 消息 → 弹窗 → 同意回发信令
 
 ```mermaid
 sequenceDiagram
     participant U as 用户
-    participant F as 前端(TS)
-    participant B as 后端(Rust)
-    participant NC as NapCat/QQ
-    participant P as 对端
+    participant F as 前端(SolidJS)
+    participant NC as NapCat
+    participant QQ as QQ 对端
 
-    U->>F: 点击「启动监听」
-    F->>B: invoke start_listen(napcat_config)
-    B->>NC: 连 NapCat WS + 起 P2P 节点(STUN 查映射)
-    B-->>F: emit listen_started(我方映射地址)
+    U->>F: 填 NapCat 地址 + token，点「测试连接」
+    F->>NC: HTTP get_login_info(经 plugin-http)
+    NC-->>F: 返回登录 QQ 号 + 昵称
+    F->>U: 显示登录态
 
-    P->>NC: QQ @机器人「给我一个p2p」
-    NC->>B: WS 推消息
-    B->>B: app.rs 解析(不再自动回)
-    B-->>F: emit p2p:request(sender_qq, 节点信息)
-    F->>U: 弹窗「XX 请求建立 P2P」+ 输入验证信息
-    U->>F: 同意 + 填验证信息(口令/备注)
-    F->>B: invoke agree_p2p(sender_qq, verify_info)
-    B->>NC: 回发自己的节点信息(含映射地址)给对方
-    B->>P: 触发 UDP 打洞 + Noise 握手
-    B-->>F: emit p2p:connected(会话详情)
-    F->>U: 通知「已连接」
+    U->>F: 点「启动监听」
+    F->>NC: WebSocket 连 ws://127.0.0.1:3001
+    NC-->>F: 推消息事件
+    F->>F: 过滤(@机器人 / P2P 协议消息)
+    F->>U: 消息流展示 + P2P 请求弹窗(请求方+验证信息表单)
+    U->>F: 输入验证信息(口令/备注) + 点「同意」
+    F->>NC: HTTP send_private_msg 回发信令(经 plugin-http)
+    NC-->>QQ: 发给对方
+    Note over F,QQ: 信令层交换完成<br/>「触发打洞」延后 F2
 ```
 
-### 步骤要点
-1. 用户在主控台点「启动监听」
-2. 后端连 NapCat WS + 起 P2P 节点（STUN 查映射）
-3. 对方在 QQ @机器人 发「给我一个p2p」
-4. [ws.rs](../../src/ws.rs) 收到 → [app.rs](../../src/app.rs) 解析 → **不再自动回**，推 `p2p:request` 事件给前端
-5. 前端弹窗「XX 请求建立 P2P」+ 输入验证信息
-6. 用户点「同意」
-7. 前端 `invoke agree_p2p(sender_qq, verify_info)`
-8. 后端：回发自己节点信息（含映射地址）给对方 → 触发打洞 → 成功后推 `p2p:connected`
+---
+
+## 四、任务计划（里程碑）
+
+### F0 方案定稿 —— 本文档 ✅
+
+- [x] 范围、技术栈、架构、数据流、验证信息、排期固化（本文件）
+- 验收：文档评审通过
+
+### F1 脚手架 + NapCat 交互跑通（本期，Windows）
+
+**目标**：从零搭起 Tauri+SolidJS 工程，跑通「登录 → 监听 → 消息流 → P2P 请求弹窗 → 同意 + 验证信息 + 回发信令」完整前端流程。
+
+任务步骤：
+
+- [ ] F1.1 脚手架：`create-tauri-app` Solid 模板在 `frontend/` 起工程；装 `@tanstack/solid-router`、`@tanstack/solid-query`、`tailwindcss@4` + `@tailwindcss/vite`、`@tauri-apps/plugin-http`、`@tauri-apps/plugin-store`
+- [ ] F1.2 `lib/napcat-client.ts`：HTTP 调用封装（plugin-http 绕 CORS），对齐 [napcat.rs](../../src/napcat.rs) 接口（`get_login_info` / `get_friends` / `send_private_msg`）
+- [ ] F1.3 登录页：NapCat HTTP/WS 地址 + token + 「测试连接」→ solid-query 调 `get_login_info` → 显示 QQ 号/昵称
+- [ ] F1.4 `lib/ws-client.ts`：NapCat WS 监听 + 消息过滤，对齐 [ws.rs](../../src/ws.rs)（`is_protocol_message` / `is_mentioned_bot` 的 TS 版）；消息流用 Signal/`createStore`
+- [ ] F1.5 `lib/protocol.ts`：P2P 请求类消息识别（「给我一个p2p」/ 节点信息），参考 [app.rs](../../src/app.rs) 流程1/2 关键词
+- [ ] F1.6 主控台：启动/停止监听开关、连接状态、消息流列表（`@tanstack/solid-virtual` 按需引入）
+- [ ] F1.7 P2P 请求弹窗 `P2pRequestToast.tsx`：请求方 QQ + 消息内容 + 验证信息表单（口令/备注）+「同意/拒绝」；同意 → 调 `send_private_msg` 回发信令
+- [ ] F1.8 配置持久化：plugin-store 存 NapCat 配置（地址/token），启动自动加载
+- [ ] F1.9 视觉基线：Tailwind v4 布局，遵循用户偏好（开放空间、脉冲状态、弱化卡片）
+
+验收标准：
+- 填配置 → 测试连接 → 显示登录 QQ 号
+- 启动监听 → WS 连上 → QQ 消息实时进消息流
+- 收到「给我一个p2p」→ 弹窗 → 输入口令/备注 → 同意 → 对方 QQ 收到回发信令
+- 「触发打洞」不在本期范围（F2）
+
+### F2 P2P 打洞集成（后端就绪后）
+
+**目标**：前端「同意」后调 Rust 后端触发实际打洞，连接结果回传展示。
+
+任务步骤：
+
+- [ ] F2.1 集成 `src/` 为 Tauri 后端 crate，暴露 commands（`start_hole_punch` 等）
+- [ ] F2.2 [app.rs](../../src/app.rs) 流程2「自动连接」改为「前端同意后触发」
+- [ ] F2.3 弹窗加「触发打洞」→ invoke 后端 holepunch/QUIC
+- [ ] F2.4 打洞进度/结果用 Tauri Event 推前端展示
+- [ ] F2.5 NAT 映射保活（等待确认期间映射不过期）
+
+验收标准：
+- 同意后实际建立 P2P 连接，前端显示「已连接」+ 会话详情
+- 打洞失败有可读错误提示
+
+### F3 Android 适配
+
+**目标**：F1+F2 流程在 Android 跑通。
+
+任务步骤：
+
+- [ ] F3.1 Tauri Android target（`aarch64-linux-android`）+ NDK 环境
+- [ ] F3.2 前台服务保活（Android 后台 WS/UDP 限制）
+- [ ] F3.3 NapCat 安卓部署引导（复用 [termux_napcat.sh](../../scripts/termux_napcat.sh)）
+- [ ] F3.4 UDP/WS 权限与电池优化实测
+
+验收标准：
+- 安卓设备跑通登录→监听→弹窗→同意→（F2 后）建连
+
+### F4 打磨
+
+- [ ] F4.1 视觉优化（开放空间 + 脉冲效果强化）
+- [ ] F4.2 WS 断线重连
+- [ ] F4.3 异常处理与错误提示完善
+- [ ] F4.4 配置项扩展（多 NapCat 实例切换等）
 
 ---
 
-## 八、「验证信息」定义
+## 五、「验证信息」（本期前端实现）
 
-用户同意连接时填写的字段，用途：
+本期前端实现验证信息表单 + 随信令回发；字段定义：
 
-| 字段 | 用途 | 是否必填 |
+| 字段 | 本期 | 用途 |
 |---|---|---|
-| 口令（secret） | 双方约定口令，握手时携带校验，不匹配则拒绝 | 可选（MVP 不强校验） |
-| 备注 | 本地标记对方身份 | 可选 |
-| 虚拟 IP | 指定本机虚拟 IP（N2 编排层用） | 可选，默认自动分配 |
+| 口令（secret） | ✅ 表单输入，随回发信令发给对方 | 双方约定，握手时携带校验（本期前端透传，不强制校验） |
+| 备注 | ✅ 表单输入，本地存储标记对方 | 本地标记对方身份 |
+| 虚拟 IP | ⏳ 延后 F2（N2 编排层用） | 本机虚拟 IP，默认自动分配 |
 
-> MVP 阶段最小集：**口令（可选）+ 备注**。口令校验留作后续在 `app.rs` 握手协议里扩展（节点信息消息加 `secret=xxx` 字段）。
-
----
-
-## 九、页面与交互设计（简述）
-
-| 页面 | 主要元素 |
-|---|---|
-| 登录页 | NapCat HTTP/WS 地址 + token + 「测试连接」按钮 → 显示登录 QQ 号与昵称 |
-| 主控台 | 启动/停止监听开关、我方映射地址、会话列表（对方 QQ / 状态 / 备注） |
-| P2P 请求弹窗 | 请求方 QQ、验证信息表单、同意/拒绝按钮 |
-| 通知/日志区 | 打洞进度、连接结果、错误提示 |
-
-> 视觉：遵循用户偏好——开放空间布局、脉冲式状态指示、弱化卡片/表格、最简进度条。但本期定位「简单页面」，功能优先，视觉打磨放 F3。
+> 本期「同意」= 通过 NapCat `send_private_msg` 把口令等信令回发给对方；「触发打洞」（实际建连）延后 F2。
 
 ---
 
-## 十、Android 支持
-
-| 项 | 说明 |
-|---|---|
-| Tauri 2 Android | 需 Android Studio + NDK + Rust target `aarch64-linux-android` |
-| UDP 打洞 | [quic_node.rs](../../src/p2p/quic_node.rs) 已 `set_nonblocking` 适配 Linux/Android |
-| NapCat 安卓 | 复用 [termux_napcat.sh](../../scripts/termux_napcat.sh)（已存在） |
-| 后台限制 | Android 对后台 WS/UDP 有限制，需前台服务（foreground service）保活 |
-| 风险 | Tauri Android 仍在演进，UDP 权限与电池优化需实测 |
-
----
-
-## 十一、任务里程碑（F0-F3）
-
-| 里程碑 | 目标 | 验收 |
-|---|---|---|
-| **F0** | 选型定稿 + 脚手架 | Tauri + Svelte 工程能跑空窗口；现有 `src/` 作为后端 crate 被引用 |
-| **F1** | Windows 跑通完整流程 | 登录 → 启动监听 → 收到 P2P 请求弹窗 → 同意 + 验证信息 → 建立连接 |
-| **F2** | Android 适配 | 同 F1 流程在 Android 跑通（含前台服务保活） |
-| **F3** | 打磨 | 视觉优化、断线重连、异常处理、配置持久化 |
-
----
-
-## 十二、风险清单
+## 六、风险清单
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
-| Tauri Android 成熟度 | F2 可能卡壳 | 先 Windows 跑通（F1）；Android 实测前先验证 Tauri Android UDP 能力 |
-| Android 后台 WS/UDP 限制 | 切后台断连 | 前台服务保活；接受「前台运行」约束 |
-| NapCat 安卓部署门槛 | 用户难上手 | 复用 termux 脚本；提供引导 |
-| 自动连接改人工确认后握手时序变化 | 对方等待我方确认期间 NAT 映射可能过期 | 保活循环（[keepalive_loop](../../legacy/holepunch-mvp/src/holepunch.rs)）持续刷新映射 |
-| libp2p 版本演进 | 升级成本高 | 锁定版本（沿用 P2P_INFRA_PLAN 约束） |
+| NapCat HTTP 无 CORS 头 | webview 直 fetch 被挡 | 用 `plugin-http`（Rust 发起，绕 CORS） |
+| NapCat WS 鉴权/格式 | 连接失败或事件解析错 | 对齐 [ws.rs](../../src/ws.rs) 已验证的事件结构；token 透传 |
+| SolidJS 中文资料少 | 排错慢 | 官方文档质量高；核心 API 少（Signal/Store/Resource） |
+| Tauri Android 成熟度 | F3 卡壳 | 先 Windows 跑通；Android 实测前先验证 Tauri Android WS 能力 |
+| 触发打洞需后端 | 「同意」后无法实际建连 | 本期同意只回发信令（QQ 消息层）；建连延后 F2 后端就绪 |
+| 安卓后台 WS 限制 | 切后台断连 | 前台服务保活；接受「前台运行」约束 |
 
 ---
 
-## 十三、下一步
+## 七、验收总览
 
-1. 用户确认决策点 D1 / D2 / D3
-2. 起脚手架（F0）：在 `h:\QQP2P` 下新建 `frontend/`（Tauri + Svelte），后端复用 `src/`
-3. 按 F1 任务拆解实施
+| 里程碑 | 一句话验收 |
+|---|---|
+| F0 | 本文件评审通过 |
+| F1 | 登录 → 监听 → 消息流 → P2P 弹窗 → 同意 + 验证信息 + 回发信令（Windows） |
+| F2 | 同意后触发打洞，前端显示「已连接」 |
+| F3 | 安卓跑通 F1+F2 流程 |
+| F4 | 视觉/重连/异常打磨完成 |
