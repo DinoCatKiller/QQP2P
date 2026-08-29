@@ -246,11 +246,7 @@ async fn run_noise_handshake(
         println!("[*] [noise] 已发送 e ({} 字节)", len);
 
         // msg 2: <- e, ee, s, es
-        let (n, _) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, sock.recv_from(&mut recv_buf))
-            .await
-            .map_err(|_| anyhow::anyhow!("Noise 握手超时: 等待 msg 2"))?
-            .context("recv_from 失败")?;
-        hs.read_message(&recv_buf[..n], &mut payload)?;
+        recv_noise_msg(sock, &mut hs, &mut recv_buf, &mut payload, "msg 2").await?;
         if let Some(remote) = hs.get_remote_static() {
             println!("[*] [noise] 对端公钥: {}", hex_encode(remote));
         }
@@ -262,11 +258,7 @@ async fn run_noise_handshake(
     } else {
         // Responder: recv → send → recv
         // msg 1: <- e
-        let (n, _) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, sock.recv_from(&mut recv_buf))
-            .await
-            .map_err(|_| anyhow::anyhow!("Noise 握手超时: 等待 msg 1"))?
-            .context("recv_from 失败")?;
-        hs.read_message(&recv_buf[..n], &mut payload)?;
+        recv_noise_msg(sock, &mut hs, &mut recv_buf, &mut payload, "msg 1").await?;
 
         // msg 2: -> e, ee, s, es
         let len = hs.write_message(&[], &mut buf)?;
@@ -274,11 +266,7 @@ async fn run_noise_handshake(
         println!("[*] [noise] 已发送 e + s ({} 字节)", len);
 
         // msg 3: <- s, se
-        let (n, _) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, sock.recv_from(&mut recv_buf))
-            .await
-            .map_err(|_| anyhow::anyhow!("Noise 握手超时: 等待 msg 3"))?
-            .context("recv_from 失败")?;
-        hs.read_message(&recv_buf[..n], &mut payload)?;
+        recv_noise_msg(sock, &mut hs, &mut recv_buf, &mut payload, "msg 3").await?;
         if let Some(remote) = hs.get_remote_static() {
             println!("[*] [noise] 对端公钥: {}", hex_encode(remote));
         }
@@ -294,4 +282,39 @@ async fn run_noise_handshake(
 /// 十六进制编码（用于打印公钥）
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Noise 握手 recv: 循环 recv 直到 read_message 成功或超时。
+///
+/// 必要性: 打洞结束后对方可能仍在 interval tick 发 HOLEPUNCH 探测包,
+/// drain 的 200ms 窗口漏掉的包会进入 Noise recv, 被当 msg 解析 -> input error。
+/// read_message 失败即跳过该包继续等, 自动过滤 HOLEPUNCH/STUN 残留。
+async fn recv_noise_msg(
+    sock: &UdpSocket,
+    hs: &mut snow::HandshakeState,
+    recv_buf: &mut [u8],
+    payload: &mut [u8],
+    label: &str,
+) -> Result<()> {
+    let deadline = tokio::time::sleep(NOISE_HANDSHAKE_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => anyhow::bail!("Noise 握手超时: 等待 {}", label),
+            res = sock.recv_from(recv_buf) => {
+                let (n, src) = res.context("recv_from 失败")?;
+                if n < 16 {
+                    println!("[*] [noise] 跳过短包 ({} 字节) from {}", n, src);
+                    continue;
+                }
+                match hs.read_message(&recv_buf[..n], payload) {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        println!("[*] [noise] 跳过非 Noise 包 ({} 字节) from {}: {}", n, src, e);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
 }
