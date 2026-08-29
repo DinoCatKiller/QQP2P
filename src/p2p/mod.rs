@@ -22,3 +22,4 @@ pub mod quic_node;
 pub use transport::start_transport;
 pub use service::P2pService;
 pub use quic_node::run_p2p_node;
+pub use quic_node::run_p2p_bench;

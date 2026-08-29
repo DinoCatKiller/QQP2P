@@ -18,11 +18,15 @@ use snow::Builder as NoiseBuilder;
 use tokio::net::UdpSocket;
 
 use crate::p2p::holepunch::{
-    build_binding_request, hole_punch, query_mapped_addr_retry, resolve_stun_server,
+    build_binding_request, detect_nat_type, hole_punch, query_mapped_addr_retry,
+    resolve_stun_server, NatType,
 };
 
 /// 默认 STUN 服务器
 const DEFAULT_STUN: &str = "stun.l.google.com:19302";
+
+/// 备用 STUN 服务器 (NAT 类型探测用, 必须与主 STUN 不同)
+const SECONDARY_STUN: &str = "stun1.l.google.com:19302";
 
 /// Noise 协议参数：XX 模式 + Curve25519 + ChaChaPoly + BLAKE2s
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -284,6 +288,41 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Unix 秒 → "YYYYMMDD_HHMMSS" (本地时区, 用 Windows API / Unix localtime)
+/// 为避免引入 chrono 依赖, 用简单算法算 UTC+8
+fn format_timestamp(unix_secs: u64) -> String {
+    // 简化: 用 UTC+8 (北京时间) 算本地时间, 避免引入 chrono
+    let secs = unix_secs + 8 * 3600;
+    let days = secs / 86400;
+    let remainder = secs % 86400;
+    let hour = remainder / 3600;
+    let min = (remainder % 3600) / 60;
+    let sec = remainder % 60;
+
+    // 从 1970-01-01 算日期
+    let mut y = 1970u32;
+    let mut d = days as u32;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        let yd = if leap { 366 } else { 365 };
+        if d < yd { break; }
+        d -= yd;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0u32;
+    for &dm in &mdays {
+        if d < dm { break; }
+        d -= dm;
+        m += 1;
+    }
+    m += 1;
+    d += 1;
+
+    format!("{:04}{:02}{:02}_{:02}{:02}{:02}", y, m, d, hour, min, sec)
+}
+
 /// Noise 握手 recv: 循环 recv 直到 read_message 成功或超时。
 ///
 /// 必要性: 打洞结束后对方可能仍在 interval tick 发 HOLEPUNCH 探测包,
@@ -317,4 +356,348 @@ async fn recv_noise_msg(
             }
         }
     }
+}
+
+// -----------------------------------------------------------
+// P2P 打洞实测 (p2p-bench 命令)
+// -----------------------------------------------------------
+
+/// 单轮测试结果
+struct BenchRound {
+    success: bool,
+    elapsed: Duration,
+    /// 失败阶段: "打洞" / "Noise握手" / "消息交换" / None(成功)
+    fail_stage: Option<&'static str>,
+    fail_reason: Option<String>,
+}
+
+impl BenchRound {
+    fn ok(elapsed: Duration) -> Self {
+        Self { success: true, elapsed, fail_stage: None, fail_reason: None }
+    }
+    fn fail(elapsed: Duration, stage: &'static str, reason: String) -> Self {
+        Self { success: false, elapsed, fail_stage: Some(stage), fail_reason: Some(reason) }
+    }
+}
+
+/// 运行 P2P 打洞实测
+///
+/// 流程:
+/// 1. 绑定 socket + NAT 类型探测 (查两次 STUN 比对端口)
+/// 2. 用户输入对方映射地址
+/// 3. 循环 N 轮, 每轮:
+///    打洞 → drain → Noise 握手 → HELLO/JOIN_ACK 交换
+///    口径3: 三步全过才算成功
+/// 4. 打印统计表 + 写 md 报告
+pub async fn run_p2p_bench(
+    port: u16,
+    stun_server: Option<&str>,
+    rounds: u32,
+    interval_secs: u64,
+    hole_timeout_secs: u64,
+) -> Result<()> {
+    let stun = stun_server.unwrap_or(DEFAULT_STUN);
+    // 时间戳用 std 生成 (避免引入 chrono 依赖)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts = format_timestamp(now);
+
+    println!("[*] ═══════════════════════════════════════════");
+    println!("[*]  P2P 打洞实测 ({} 轮)", rounds);
+    println!("[*] ═══════════════════════════════════════════");
+    println!("[*] 监听端口: {}", port);
+    println!("[*] STUN 服务器: {}", stun);
+    println!("[*] 单轮打洞超时: {}s", hole_timeout_secs);
+    println!("[*] 轮间间隔: {}s", interval_secs);
+    println!();
+
+    // 1. 创建 socket
+    let std_sock = std::net::UdpSocket::bind(format!("0.0.0.0:{}", port))?;
+    std_sock.set_nonblocking(true)?;
+    let tokio_sock = tokio::net::UdpSocket::from_std(std_sock)?;
+
+    let stun_addr = resolve_stun_server(stun).await?;
+    let stun_secondary_addr = resolve_stun_server(SECONDARY_STUN).await?;
+
+    // 2. NAT 类型探测
+    println!("[*] ── NAT 类型探测 ──");
+    let nat_type = detect_nat_type(&tokio_sock, stun_addr, stun_secondary_addr).await;
+    let (my_mapped, nat_label) = match &nat_type {
+        NatType::Cone { mapped } => {
+            println!("[*] 主 STUN  → {}", mapped);
+            println!("[*] 备 STUN  → (端口一致)");
+            println!("[*] NAT 类型: {}", nat_type.label());
+            (*mapped, "Cone")
+        }
+        NatType::Symmetric { mapped1, mapped2 } => {
+            println!("[*] 主 STUN  → {} (端口 {})", mapped1, mapped1.port());
+            println!("[*] 备 STUN  → {} (端口 {})", mapped2, mapped2.port());
+            println!("[*] NAT 类型: {}", nat_type.label());
+            println!("[!] 警告: 本机是 Symmetric NAT, 纯 UDP 打洞大概率失败");
+            (*mapped1, "Symmetric")
+        }
+        NatType::Unknown { reason } => {
+            println!("[!] NAT 探测失败: {}", reason);
+            anyhow::bail!("NAT 探测失败, 无法继续");
+        }
+    };
+    println!("[*] 本机映射地址: {}", my_mapped);
+    println!();
+
+    // 3. 输入对方地址
+    println!("[*] ── 操作说明 ──");
+    println!("[*] 1. 把上面的「映射地址」发给对方");
+    println!("[*] 2. 输入对方给你的映射地址并回车");
+    println!("[*] 3. 双方都输入后同时开始 {} 轮测试", rounds);
+    println!();
+    print!("[*] 请输入对方映射地址 (ip:port): ");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+
+    let input = tokio::task::spawn_blocking(|| {
+        let mut s = String::new();
+        let _ = std::io::stdin().read_line(&mut s);
+        s
+    })
+    .await?;
+
+    let input = input.trim();
+    if input.is_empty() {
+        anyhow::bail!("未输入对方地址");
+    }
+    let peer_mapped: SocketAddr = input.parse()?;
+    println!();
+    println!("[*] 对端: {}", peer_mapped);
+    println!("[*] 开始 {} 轮测试", rounds);
+    println!();
+
+    // 4. 循环测试
+    let mut results: Vec<BenchRound> = Vec::with_capacity(rounds as usize);
+    println!("轮次 | 结果 | 耗时  | 失败阶段");
+    println!("-----|------|-------|----------------");
+
+    for round in 1..=rounds {
+        let t0 = std::time::Instant::now();
+        let result = run_one_bench_round(
+            port, my_mapped, peer_mapped, stun_addr, hole_timeout_secs,
+        )
+        .await;
+        let elapsed = t0.elapsed();
+
+        let r = match result {
+            Ok(()) => BenchRound::ok(elapsed),
+            Err((stage, e)) => BenchRound::fail(elapsed, stage, e.to_string()),
+        };
+
+        // 打印该轮结果
+        let mark = if r.success { "✓" } else { "✗" };
+        let stage = r.fail_stage.unwrap_or("-");
+        let reason = r.fail_reason.as_deref().unwrap_or("");
+        println!(
+            "  {:>2} | {}    | {:>5.1}s | {} {}",
+            round, mark, elapsed.as_secs_f64(), stage,
+            if reason.is_empty() { String::new() } else { format!("({})", reason) }
+        );
+
+        results.push(r);
+
+        // 轮间间隔 (最后一轮不用等)
+        if round < rounds {
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        }
+    }
+
+    // 5. 统计
+    let success_count = results.iter().filter(|r| r.success).count();
+    let fail_count = results.len() - success_count;
+    let success_rate = success_count as f64 / results.len() as f64 * 100.0;
+    let avg_success_elapsed: f64 = {
+        let successes: Vec<f64> = results.iter()
+            .filter(|r| r.success)
+            .map(|r| r.elapsed.as_secs_f64())
+            .collect();
+        if successes.is_empty() { 0.0 } else { successes.iter().sum::<f64>() / successes.len() as f64 }
+    };
+
+    // 失败阶段分布
+    let mut fail_stages: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for r in &results {
+        if let Some(stage) = r.fail_stage {
+            *fail_stages.entry(stage).or_insert(0) += 1;
+        }
+    }
+
+    println!();
+    println!("═══════════════════════════════════════════════");
+    println!(" 实测统计");
+    println!("═══════════════════════════════════════════════");
+    println!("总轮数:      {}", results.len());
+    println!("成功:         {}", success_count);
+    println!("失败:         {}", fail_count);
+    println!("通过率:    {:.1}%", success_rate);
+    println!("成功平均耗时: {:.2}s", avg_success_elapsed);
+    println!("本机 NAT:  {}", nat_label);
+    if !fail_stages.is_empty() {
+        println!("失败阶段分布:");
+        for (stage, count) in &fail_stages {
+            println!("  - {}: {} 次", stage, count);
+        }
+    }
+    println!();
+
+    // 6. 写 md 报告
+    let report_name = format!("bench_report_{}.md", ts);
+    let report_path = std::path::Path::new(&report_name);
+    let report = format_bench_report(
+        &ts,
+        my_mapped, peer_mapped, nat_label,
+        rounds, &results,
+        success_rate, avg_success_elapsed, &fail_stages,
+    );
+    std::fs::write(&report_path, report)?;
+    println!("[+] 报告已写入: {}", report_path.display());
+
+    Ok(())
+}
+
+/// 跑一轮完整测试: 打洞 → drain → Noise 握手 → HELLO 交换
+///
+/// 注意: 每轮用新 socket, 因为旧 socket 的 NAT 映射可能已过期/被回收,
+///       新 socket 会触发 NAT 重新分配端口 (更真实的模拟)
+async fn run_one_bench_round(
+    port: u16,
+    _my_mapped: SocketAddr,
+    peer_mapped: SocketAddr,
+    stun_addr: SocketAddr,
+    hole_timeout: u64,
+) -> std::result::Result<(), (&'static str, anyhow::Error)> {
+    // 新 socket (模拟真实场景: 每次连接都是新的)
+    let std_sock = std::net::UdpSocket::bind(format!("0.0.0.0:{}", port))
+        .map_err(|e| ("打洞", anyhow::anyhow!("bind 失败: {}", e)))?;
+    std_sock.set_nonblocking(true)
+        .map_err(|e| ("打洞", anyhow::anyhow!("set_nonblocking 失败: {}", e)))?;
+    let sock = tokio::net::UdpSocket::from_std(std_sock)
+        .map_err(|e| ("打洞", anyhow::anyhow!("from_std 失败: {}", e)))?;
+
+    // 重新查本机映射 (NAT 可能给了新端口)
+    let my_mapped = query_mapped_addr_retry(&sock, stun_addr).await
+        .map_err(|e| ("打洞", anyhow::anyhow!("STUN 查询失败: {}", e)))?;
+
+    // === 阶段1: 打洞 ===
+    hole_punch(&sock, peer_mapped, 1, hole_timeout).await
+        .map_err(|e| ("打洞", e))?;
+
+    // === drain 残留包 ===
+    let mut drain_buf = [0u8; UDP_RECV_BUF];
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut drain_buf)).await {
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    // === 阶段2: Noise 握手 ===
+    let builder = NoiseBuilder::new(NOISE_PATTERN.parse().unwrap());
+    let keypair = builder.generate_keypair()
+        .map_err(|e| ("Noise握手", anyhow::anyhow!("生成密钥失败: {}", e)))?;
+    let is_initiator = my_mapped < peer_mapped;
+    let mut transport = run_noise_handshake(&sock, peer_mapped, is_initiator, &keypair.private).await
+        .map_err(|e| ("Noise握手", e))?;
+
+    // === 阶段3: 消息交换 (HELLO + JOIN_ACK) ===
+    let payload = "HELLO peer_id=local virtual_ip=10.0.0.1 features=3\n\
+                   JOIN_ACK members=2 peer_id=local virtual_ip=10.0.0.1 peer_id=remote virtual_ip=10.0.0.1";
+    let mut send_buf = vec![0u8; UDP_RECV_BUF];
+    let send_len = transport.write_message(payload.as_bytes(), &mut send_buf)
+        .map_err(|e| ("消息交换", anyhow::anyhow!("加密失败: {}", e)))?;
+    sock.send_to(&send_buf[..send_len], peer_mapped).await
+        .map_err(|e| ("消息交换", anyhow::anyhow!("send_to 失败: {}", e)))?;
+
+    let mut recv_buf = vec![0u8; UDP_RECV_BUF];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(10), sock.recv_from(&mut recv_buf))
+        .await
+        .map_err(|_| ("消息交换", anyhow::anyhow!("等待对方消息超时")))?
+        .map_err(|e| ("消息交换", anyhow::anyhow!("recv_from 失败: {}", e)))?;
+
+    let mut pt = vec![0u8; UDP_RECV_BUF];
+    let pt_len = transport.read_message(&recv_buf[..n], &mut pt)
+        .map_err(|e| ("消息交换", anyhow::anyhow!("解密失败: {}", e)))?;
+
+    // 验证收到的确实是 HELLO
+    let received = String::from_utf8_lossy(&pt[..pt_len]);
+    if !received.contains("HELLO") {
+        return Err(("消息交换", anyhow::anyhow!("收到的消息不是 HELLO: {}", received)));
+    }
+
+    Ok(())
+}
+
+/// 格式化 md 报告 (对应 N1.5 实测记录)
+fn format_bench_report(
+    ts: &str,
+    my_mapped: SocketAddr,
+    peer_mapped: SocketAddr,
+    nat_label: &str,
+    rounds: u32,
+    results: &[BenchRound],
+    success_rate: f64,
+    avg_success_elapsed: f64,
+    fail_stages: &std::collections::HashMap<&str, u32>,
+) -> String {
+    let success_count = results.iter().filter(|r| r.success).count();
+    let fail_count = results.len() - success_count;
+
+    let mut md = String::new();
+    md.push_str("# P2P 打洞实测报告\n\n");
+    md.push_str(&format!("- 时间: {}\n", ts));
+    md.push_str(&format!("- 本机: {} ({})\n", my_mapped, nat_label));
+    md.push_str(&format!("- 对端: {}\n", peer_mapped));
+    md.push_str("- 场景: 宽带 ↔ 手机热点 (或其它, 请手动标注)\n\n");
+
+    md.push_str("## 结果\n\n");
+    md.push_str(&format!("- 总轮数: {}\n", rounds));
+    md.push_str(&format!("- 成功: {}\n", success_count));
+    md.push_str(&format!("- 失败: {}\n", fail_count));
+    md.push_str(&format!("- 通过率: {:.1}%\n", success_rate));
+    md.push_str(&format!("- 成功平均耗时: {:.2}s\n", avg_success_elapsed));
+    md.push_str(&format!("- 本机 NAT: {}\n", nat_label));
+
+    if !fail_stages.is_empty() {
+        md.push_str("\n## 失败阶段分布\n\n");
+        for (stage, count) in fail_stages {
+            md.push_str(&format!("- {}: {} 次\n", stage, count));
+        }
+    }
+
+    md.push_str("\n## 逐轮明细\n\n");
+    md.push_str("| 轮次 | 结果 | 耗时(s) | 失败阶段 | 失败原因 |\n");
+    md.push_str("|------|------|---------|----------|----------|\n");
+    for (i, r) in results.iter().enumerate() {
+        let mark = if r.success { "✓" } else { "✗" };
+        let stage = r.fail_stage.unwrap_or("-");
+        let reason = r.fail_reason.as_deref().unwrap_or("");
+        md.push_str(&format!(
+            "| {} | {} | {:.2} | {} | {} |\n",
+            i + 1, mark, r.elapsed.as_secs_f64(), stage, reason
+        ));
+    }
+
+    md.push_str("\n## 结论\n\n");
+    md.push_str("<!-- 请手动填写 -->\n");
+    md.push_str(&format!("- 通过率 {}% ", success_rate));
+    if success_rate >= 100.0 {
+        md.push_str("≥ 100% 阈值, 直连方案达标\n");
+        md.push_str("- 建议: 可推进 N2 编排层\n");
+    } else if success_rate >= 50.0 {
+        md.push_str("部分达标, 存在失败场景\n");
+        md.push_str("- 建议: 评估失败原因, 考虑 Symmetric NAT 端口预测 或 N4 中继兜底\n");
+    } else {
+        md.push_str("未达标\n");
+        md.push_str("- 建议: 启动 N4 中继兜底, 或更换网络方案\n");
+    }
+
+    md
 }

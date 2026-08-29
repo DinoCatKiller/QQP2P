@@ -103,6 +103,23 @@ enum Commands {
         #[arg(short, long)]
         stun: Option<String>,
     },
+    /// P2P 打洞实测：NAT 探测 + N 轮打洞+握手+消息交换, 统计通过率, 写 md 报告
+    P2pBench {
+        #[arg(short, long, default_value = "30303")]
+        port: u16,
+        /// STUN 服务器（默认 stun.l.google.com:19302）
+        #[arg(short, long)]
+        stun: Option<String>,
+        /// 测试轮数（默认 10）
+        #[arg(short, long, default_value = "10")]
+        rounds: u32,
+        /// 每轮间隔秒数（默认 5, 给 NAT 映射恢复时间）
+        #[arg(short, long, default_value = "5")]
+        interval: u64,
+        /// 单轮打洞超时秒（默认 10）
+        #[arg(short = 't', long, default_value = "10")]
+        hole_timeout: u64,
+    },
 }
 
 #[tokio::main]
@@ -360,6 +377,12 @@ async fn main() -> Result<()> {
         // N1: P2P 节点 (STUN + UDP 打洞 + QUIC 握手)
         Commands::P2pNode { port, stun } => {
             crate::p2p::run_p2p_node(port, stun.as_deref()).await
+        }
+        Commands::P2pBench { port, stun, rounds, interval, hole_timeout } => {
+            crate::p2p::run_p2p_bench(
+                port, stun.as_deref(),
+                rounds, interval, hole_timeout,
+            ).await
         }
     }
 }

@@ -139,6 +139,63 @@ pub async fn query_mapped_addr_retry(sock: &UdpSocket, stun_server: SocketAddr) 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("STUN 查询失败")))
 }
 
+/// NAT 类型探测结果
+#[derive(Debug, Clone)]
+pub enum NatType {
+    /// 两次 STUN 映射端口一致 → Cone NAT (打洞可行)
+    Cone { mapped: SocketAddr },
+    /// 两次 STUN 映射端口不同 → Symmetric NAT (纯 UDP 打洞基本无解)
+    Symmetric { mapped1: SocketAddr, mapped2: SocketAddr },
+    /// 探测失败
+    Unknown { reason: String },
+}
+
+impl NatType {
+    pub fn is_symmetric(&self) -> bool {
+        matches!(self, NatType::Symmetric { .. })
+    }
+
+    /// 返回主映射地址 (Symmetric 时返回第一次查到的)
+    pub fn mapped(&self) -> Option<SocketAddr> {
+        match self {
+            NatType::Cone { mapped } => Some(*mapped),
+            NatType::Symmetric { mapped1, .. } => Some(*mapped1),
+            NatType::Unknown { .. } => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            NatType::Cone { .. } => "Cone (端口稳定, 打洞可行)",
+            NatType::Symmetric { .. } => "Symmetric (端口变化, 纯 UDP 打洞基本无解)",
+            NatType::Unknown { .. } => "未知",
+        }
+    }
+}
+
+/// NAT 类型探测：向两个不同 STUN 服务器查询映射地址，比对端口
+///
+/// - 端口一致 → Cone NAT (打洞有戏)
+/// - 端口变化 → Symmetric NAT (纯 UDP 打洞基本无解)
+///
+/// 注意：必须用同一 socket 查询，否则测的不是 NAT 行为而是 socket 行为
+pub async fn detect_nat_type(sock: &UdpSocket, stun_primary: SocketAddr, stun_secondary: SocketAddr) -> NatType {
+    let m1 = match query_mapped_addr_retry(sock, stun_primary).await {
+        Ok(m) => m,
+        Err(e) => return NatType::Unknown { reason: format!("主 STUN 查询失败: {}", e) },
+    };
+    let m2 = match query_mapped_addr_retry(sock, stun_secondary).await {
+        Ok(m) => m,
+        Err(e) => return NatType::Unknown { reason: format!("备 STUN 查询失败: {}", e) },
+    };
+
+    if m1.port() == m2.port() {
+        NatType::Cone { mapped: m1 }
+    } else {
+        NatType::Symmetric { mapped1: m1, mapped2: m2 }
+    }
+}
+
 /// 双方同时 UDP 打洞
 ///
 /// 双方同时向对方映射地址发探测包，互开 NAT 洞。
