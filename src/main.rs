@@ -111,7 +111,7 @@ enum Commands {
         #[arg(short, long)]
         stun: Option<String>,
         /// 测试轮数（默认 10）
-        #[arg(short, long, default_value = "10")]
+        #[arg(short = 'n', long, default_value = "10")]
         rounds: u32,
         /// 每轮间隔秒数（默认 5, 给 NAT 映射恢复时间）
         #[arg(short, long, default_value = "5")]

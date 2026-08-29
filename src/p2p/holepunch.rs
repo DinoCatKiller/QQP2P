@@ -151,11 +151,13 @@ pub enum NatType {
 }
 
 impl NatType {
+    #[allow(dead_code)]
     pub fn is_symmetric(&self) -> bool {
         matches!(self, NatType::Symmetric { .. })
     }
 
     /// 返回主映射地址 (Symmetric 时返回第一次查到的)
+    #[allow(dead_code)]
     pub fn mapped(&self) -> Option<SocketAddr> {
         match self {
             NatType::Cone { mapped } => Some(*mapped),
